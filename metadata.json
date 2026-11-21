@@ -1,0 +1,6 @@
+{
+  "name": "Meridian State University — Student Feedback System",
+  "description": "AI-powered Online Student Feedback Collection System with 18-table relational storage, Chart.js analytics, multi-language support, and exportable Flask/MySQL/Vercel deployment bundle.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
