@@ -31,6 +31,9 @@ interface StudentDashboardData {
     id: number;
     department_id: number;
     course_id: number;
+    proctor_faculty_id?: number | null;
+    proctor_name?: string | null;
+    proctor_employee_code?: string | null;
     department_name: string;
     course_code?: string;
     course_name: string;
@@ -48,6 +51,24 @@ interface StudentDashboardData {
     submitted_at: string;
     subject_name: string;
     subject_code: string;
+  }>;
+  pendingRequests?: Array<{
+    id: number;
+    form_id: number;
+    subject_id: number;
+    faculty_id: number | null;
+    status: 'pending' | 'in_progress' | 'completed';
+    request_note: string;
+    requested_at: string;
+    completed_at: string | null;
+    form_title: string;
+    close_date: string;
+    subject_code: string;
+    short_code?: string | null;
+    subject_name: string;
+    semester_name: string;
+    faculty_name: string | null;
+    proctor_name: string | null;
   }>;
   progress: {
     submittedCount: number;
@@ -201,7 +222,7 @@ export function StudentDashboardView({
         <div className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111C2E]">
           <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Enrolled Program</p>
           <p className="mt-1.5 font-mono text-base font-bold tracking-tight text-[#1E40AF] dark:text-blue-400">
-            {data.student?.roll_number || '24SUUBECS001'}
+            {data.student?.roll_number || '24SUUBECS0001'}
           </p>
           <p className="mt-1 text-xs font-semibold text-slate-900 dark:text-white">
             {data.student?.course_code ? `${data.student.course_code} · ` : ''}
@@ -211,6 +232,12 @@ export function StudentDashboardView({
             {data.student?.department_name || 'Computer Science & Engineering'} ·{' '}
             {data.student?.semester_name || 'Semester 5'}
           </p>
+          {data.student?.proctor_name && (
+            <p className="mt-1 text-[11px] font-medium text-slate-600 dark:text-slate-300">
+              Proctor: {data.student.proctor_name}
+              {data.student.proctor_employee_code ? ` (${data.student.proctor_employee_code})` : ''}
+            </p>
+          )}
         </div>
 
         <div className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111C2E]">
@@ -297,6 +324,81 @@ export function StudentDashboardView({
                       {sem.submitted_count}
                     </span>
                   </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Online Feedback Requests Sent by Faculty & Proctors */}
+      {(data.pendingRequests?.length ?? 0) > 0 && (
+        <div className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111C2E]">
+          <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-center">
+            <div>
+              <h2 className="text-base font-semibold text-slate-900 dark:text-white">
+                Online Feedback Requests Assigned to You
+              </h2>
+              <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                Direct evaluation requests from your subject instructors and assigned proctor.
+              </p>
+            </div>
+            <span className="font-mono text-xs font-semibold text-[#1E40AF] dark:text-blue-400">
+              {data.pendingRequests!.filter((r) => r.status !== 'completed').length} pending ·{' '}
+              {data.pendingRequests!.filter((r) => r.status === 'completed').length} completed
+            </span>
+          </div>
+          <div className="mt-4 divide-y divide-slate-200 dark:divide-slate-800">
+            {data.pendingRequests!.map((req) => (
+              <div key={req.id} className="flex flex-col justify-between gap-3 py-3 sm:flex-row sm:items-center">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-xs font-semibold text-[#1E40AF] dark:text-blue-400">
+                      {req.subject_code}
+                      {req.short_code ? ` (${req.short_code})` : ''}
+                    </span>
+                    <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                      {req.subject_name}
+                    </span>
+                    <span
+                      className={`rounded px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
+                        req.status === 'completed'
+                          ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
+                          : req.status === 'in_progress'
+                          ? 'bg-blue-50 text-blue-700 dark:bg-blue-950/40 dark:text-blue-300'
+                          : 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300'
+                      }`}
+                    >
+                      {req.status === 'completed' ? 'Completed' : req.status === 'in_progress' ? 'Draft Saved' : 'Pending'}
+                    </span>
+                  </div>
+                  <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                    {req.semester_name} · Faculty: {req.faculty_name || 'Department Faculty'}
+                    {req.proctor_name ? ` · Proctor: ${req.proctor_name}` : ''} · Closes{' '}
+                    <span className="font-mono">{req.close_date}</span>
+                  </p>
+                  {req.request_note && (
+                    <p className="mt-1 text-xs text-slate-600 dark:text-slate-300">{req.request_note}</p>
+                  )}
+                </div>
+                <div className="shrink-0">
+                  {req.status !== 'completed' ? (
+                    <button
+                      type="button"
+                      onClick={() => onSelectFormForSubmission(req.form_id, req.subject_id)}
+                      className="rounded-lg bg-[#1E40AF] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#1E3A8A] dark:bg-blue-600"
+                    >
+                      Complete Evaluation
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('feedback-history')}
+                      className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                    >
+                      View Receipt
+                    </button>
+                  )}
                 </div>
               </div>
             ))}
@@ -574,10 +676,20 @@ export function FeedbackSubmitView({
   }, [catalog, departmentId, courseId, semesterId]);
 
   useEffect(() => {
-    if (!editingEntry && filteredSubjects.length > 0 && !filteredSubjects.some((s) => s.id === subjectId)) {
-      setSubjectId(filteredSubjects[0].id);
+    if (!editingEntry && preselectedSubjectId) {
+      setSubjectId(preselectedSubjectId);
     }
-  }, [filteredSubjects, subjectId, editingEntry]);
+  }, [preselectedSubjectId, editingEntry]);
+
+  useEffect(() => {
+    if (!editingEntry && filteredSubjects.length > 0 && !filteredSubjects.some((s) => s.id === subjectId)) {
+      if (preselectedSubjectId && (catalog?.subjects ?? []).some((s) => s.id === preselectedSubjectId)) {
+        setSubjectId(preselectedSubjectId);
+      } else {
+        setSubjectId(filteredSubjects[0].id);
+      }
+    }
+  }, [filteredSubjects, subjectId, editingEntry, preselectedSubjectId, catalog]);
 
   const selectedSubject = useMemo(
     () => (catalog?.subjects ?? []).find((s) => s.id === subjectId) || null,
@@ -1225,7 +1337,7 @@ export function FeedbackHistoryView({
                           onClick={() =>
                             downloadAuthenticatedBlob(
                               `/feedback/submissions/${row.id}/receipt/pdf`,
-                              `SNU_Receipt_${row.subject_code}_${row.id}.pdf`
+                              `SNPSU_Receipt_${row.subject_code}_${row.id}.pdf`
                             )
                           }
                           className="inline-flex items-center gap-1 rounded border border-[#1E40AF]/30 bg-blue-50/70 px-2.5 py-1 text-xs font-medium text-[#1E40AF] hover:bg-blue-100 dark:border-blue-500/40 dark:bg-blue-950/40 dark:text-blue-300 dark:hover:bg-blue-900/50"
@@ -1259,10 +1371,10 @@ export function FeedbackHistoryView({
             <div className="flex items-start justify-between gap-4">
               <div>
                 <h3 className="text-base font-bold text-slate-900 dark:text-white">
-                  Submission Receipt · SNU-REC-{String(detailRow.id).padStart(5, '0')}
+                  Submission Receipt · SNPSU-REC-{String(detailRow.id).padStart(5, '0')}
                 </h3>
                 <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                  {detailRow.roll_number || '24SUUBECS001'} · {detailRow.subject_code}
+                  {detailRow.roll_number || '24SUUBECS0001'} · {detailRow.subject_code}
                   {detailRow.short_code ? ` (${detailRow.short_code})` : ''} · {detailRow.subject_name}
                 </p>
                 <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
@@ -1292,7 +1404,7 @@ export function FeedbackHistoryView({
                   <div className="flex h-24 w-24 items-center justify-center text-[11px] text-slate-400">Loading QR...</div>
                 )}
                 <span className="mt-1 font-mono text-[10px] text-slate-500">
-                  {detailQr?.receiptNumber || `SNU-REC-${String(detailRow.id).padStart(5, '0')}`}
+                  {detailQr?.receiptNumber || `SNPSU-REC-${String(detailRow.id).padStart(5, '0')}`}
                 </span>
               </div>
             </div>
@@ -1330,7 +1442,7 @@ export function FeedbackHistoryView({
                 onClick={() =>
                   downloadAuthenticatedBlob(
                     `/feedback/submissions/${detailRow.id}/receipt/pdf`,
-                    `SNU_Receipt_${detailRow.subject_code}_${detailRow.id}.pdf`
+                    `SNPSU_Receipt_${detailRow.subject_code}_${detailRow.id}.pdf`
                   )
                 }
                 className="inline-flex items-center gap-1.5 rounded-lg bg-[#1E40AF] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E3A8A] dark:bg-blue-600"
@@ -1352,7 +1464,7 @@ export function FeedbackHistoryView({
                   Receipt Verification QR
                 </h3>
                 <p className="mt-1 font-mono text-xs text-[#1E40AF] dark:text-blue-400">
-                  {qrOnlyModal.receiptNumber} · {qrOnlyModal.row.roll_number || '24SUUBECS001'}
+                  {qrOnlyModal.receiptNumber} · {qrOnlyModal.row.roll_number || '24SUUBECS0001'}
                 </p>
                 <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
                   {qrOnlyModal.row.subject_code}
@@ -1407,7 +1519,7 @@ export function FeedbackHistoryView({
                 onClick={() =>
                   downloadAuthenticatedBlob(
                     `/feedback/submissions/${qrOnlyModal.row.id}/receipt/pdf`,
-                    `SNU_Receipt_${qrOnlyModal.row.subject_code}_${qrOnlyModal.row.id}.pdf`
+                    `SNPSU_Receipt_${qrOnlyModal.row.subject_code}_${qrOnlyModal.row.id}.pdf`
                   )
                 }
                 className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-[#0B192C] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E40AF] dark:bg-slate-800"

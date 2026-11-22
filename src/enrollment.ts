@@ -1,4 +1,4 @@
-export const ENROLLMENT_FORMAT_REGEX = /^\d{2}SUU[A-Z]{2,6}\d{3}$/;
+export const ENROLLMENT_FORMAT_REGEX = /^\d{2}SUU[A-Z]{2,6}\d{4}$/;
 
 export const DEPT_PROGRAM_INFIX: Record<string, string> = {
   CSE: 'BECS',

@@ -28,24 +28,42 @@ import type {
   DepartmentSemesterTrackingResponse,
   FeedbackFormItem,
   LanguageCode,
+  ProctorMenteeRecord,
+  ProctorSubjectAnalysisRow,
   SemesterTrackingItem,
   StudentProfileRecord,
+  SubjectPollItem,
 } from '../types.ts';
 
 // ---------------------------------------------------------------------------
-// PAGE 8: FACULTY DASHBOARD
+// PAGE 8: FACULTY DASHBOARD (REQUESTS, POLLS, PROCTOR ANALYSIS & STUDENT DB)
 // ---------------------------------------------------------------------------
 export function FacultyDashboardView({ isDark }: { isDark: boolean }) {
   const [data, setData] = useState<{
     faculty: { id: number; full_name: string; department_name: string; designation: string; employee_code: string };
+    allFaculty?: Array<{
+      id: number;
+      full_name: string;
+      employee_code: string;
+      department_code: string;
+      department_name: string;
+      designation: string;
+    }>;
+    activeForms?: Array<{ id: number; title: string; close_date: string; qr_token: string }>;
     assignedSubjects: Array<{
       id: number;
       code: string;
+      short_code?: string | null;
       name: string;
       course_name: string;
       semester_name: string;
       response_count: number;
       avg_satisfaction: number | null;
+      avg_teaching?: number | null;
+      avg_infrastructure?: number | null;
+      requests_sent?: number;
+      completed_requests?: number;
+      pending_requests?: number;
     }>;
     metrics: {
       total_responses: number;
@@ -56,29 +74,132 @@ export function FacultyDashboardView({ isDark }: { isDark: boolean }) {
       avg_knowledge: number | null;
       avg_methodology: number | null;
     };
+    requestStats?: {
+      total_requests: number;
+      completed_requests: number;
+      in_progress_requests: number;
+      pending_requests: number;
+      completion_rate: number;
+    };
     semesterTrend: Array<{ semester_name: string; avg_satisfaction: number; submissions: number }>;
     anonymizedComments: Array<{
       id: number;
       subject_code: string;
+      short_code?: string | null;
       subject_name: string;
+      semester_name?: string;
+      is_anonymous?: number;
+      respondent_display?: string;
       comment_text: string;
       overall_satisfaction: number;
+      teaching_quality?: number;
+      infrastructure?: number;
       submitted_at: string;
       sentiment: string | null;
       primary_category: string | null;
     }>;
+    subjectPolls?: SubjectPollItem[];
+    proctorMentees?: ProctorMenteeRecord[];
+    proctorSubjectAnalysis?: ProctorSubjectAnalysisRow[];
+    proctorReviews?: Array<{
+      id: number;
+      subject_code: string;
+      short_code?: string | null;
+      subject_name: string;
+      semester_name: string;
+      instructor_name: string | null;
+      is_anonymous: number;
+      respondent_display: string;
+      comment_text: string;
+      overall_satisfaction: number;
+      teaching_quality: number;
+      infrastructure: number;
+      submitted_at: string;
+      sentiment: string | null;
+      primary_category: string | null;
+    }>;
+    studentDatabase?: Array<{
+      student_id: number;
+      roll_number: string;
+      full_name: string;
+      email: string;
+      department_code: string;
+      department_name: string;
+      course_code: string;
+      semester_name: string;
+      term_order: number;
+      proctor_name: string | null;
+      requests_given: number;
+      feedbacks_completed: number;
+      feedbacks_pending: number;
+    }>;
     recommendations: Array<{ id: number; recommendation_title: string; recommendation_body: string; priority: string }>;
   } | null>(null);
+  const [selectedFacultyId, setSelectedFacultyId] = useState<string>('');
+  const [activeTab, setActiveTab] = useState<'all' | 'polls' | 'proctor' | 'students'>('all');
+  const [studentSearch, setStudentSearch] = useState('');
+  const [dispatchForm, setDispatchForm] = useState({
+    form_id: '',
+    subject_id: '',
+    target_scope: 'subject_students' as 'subject_students' | 'proctor_mentees' | 'all_dept_students',
+    request_note: 'Please submit your semester course feedback evaluation.',
+  });
+  const [dispatchBusy, setDispatchBusy] = useState(false);
+  const [dispatchMsg, setDispatchMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  useEffect(() => {
+  const loadFacultyDashboard = useCallback(async () => {
     setLoading(true);
-    apiRequest<NonNullable<typeof data>>('/faculty/dashboard')
-      .then(setData)
-      .catch((err) => setErrorMsg(err instanceof Error ? err.message : 'Unable to load faculty dashboard.'))
-      .finally(() => setLoading(false));
-  }, []);
+    setErrorMsg(null);
+    const qs = selectedFacultyId ? `?facultyId=${encodeURIComponent(selectedFacultyId)}` : '';
+    try {
+      const res = await apiRequest<NonNullable<typeof data>>(`/faculty/dashboard${qs}`);
+      setData(res);
+      if (res.activeForms?.length && !dispatchForm.form_id) {
+        setDispatchForm((f) => ({ ...f, form_id: String(res.activeForms![0].id) }));
+      }
+      if (res.assignedSubjects?.length && !dispatchForm.subject_id) {
+        setDispatchForm((f) => ({ ...f, subject_id: String(res.assignedSubjects[0].id) }));
+      }
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Unable to load faculty dashboard.');
+    } finally {
+      setLoading(false);
+    }
+  }, [selectedFacultyId]);
+
+  useEffect(() => {
+    loadFacultyDashboard();
+  }, [loadFacultyDashboard]);
+
+  async function handleDispatchRequests(e: FormEvent) {
+    e.preventDefault();
+    if (!data) return;
+    setDispatchBusy(true);
+    setDispatchMsg(null);
+    try {
+      const res = await apiRequest<{ message: string; inserted: number; skippedExisting: number }>(
+        '/faculty/requests/dispatch',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            faculty_id: data.faculty.id,
+            form_id: dispatchForm.form_id ? Number(dispatchForm.form_id) : undefined,
+            subject_id: dispatchForm.subject_id ? Number(dispatchForm.subject_id) : undefined,
+            target_scope: dispatchForm.target_scope,
+            request_note: dispatchForm.request_note,
+          }),
+        }
+      );
+      setDispatchMsg(res.message);
+      await loadFacultyDashboard();
+    } catch (err) {
+      setDispatchMsg(err instanceof Error ? err.message : 'Failed to dispatch requests.');
+    } finally {
+      setDispatchBusy(false);
+    }
+  }
 
   if (loading) return <div className="h-64 animate-pulse rounded-xl bg-slate-200 dark:bg-slate-800" />;
   if (errorMsg) {
@@ -91,6 +212,17 @@ export function FacultyDashboardView({ isDark }: { isDark: boolean }) {
   if (!data) return null;
 
   const satisfactionPct = data.metrics.avg_overall ? Math.round((data.metrics.avg_overall / 5) * 100) : 0;
+  const filteredStudentDb = (data.studentDatabase ?? []).filter((stu) => {
+    const q = studentSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      stu.roll_number.toLowerCase().includes(q) ||
+      stu.full_name.toLowerCase().includes(q) ||
+      stu.department_code.toLowerCase().includes(q) ||
+      stu.semester_name.toLowerCase().includes(q) ||
+      (stu.proctor_name || '').toLowerCase().includes(q)
+    );
+  });
 
   return (
     <div className="space-y-6">
@@ -100,9 +232,28 @@ export function FacultyDashboardView({ isDark }: { isDark: boolean }) {
             {data.faculty.department_name} · {data.faculty.employee_code}
           </p>
           <h2 className="mt-1 text-xl font-bold text-slate-900 dark:text-white">{data.faculty.full_name}</h2>
-          <p className="text-xs text-slate-500 dark:text-slate-400">{data.faculty.designation}</p>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {data.faculty.designation} · Subject Instructor &amp; Proctor Workbench
+          </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          {(data.allFaculty?.length ?? 0) > 1 && (
+            <select
+              value={selectedFacultyId || String(data.faculty.id)}
+              onChange={(e) => {
+                setSelectedFacultyId(e.target.value);
+                setDispatchForm((f) => ({ ...f, subject_id: '' }));
+              }}
+              aria-label="Inspect Faculty / Proctor Profile"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+            >
+              {data.allFaculty!.map((fac) => (
+                <option key={fac.id} value={String(fac.id)}>
+                  {fac.full_name} ({fac.department_code})
+                </option>
+              ))}
+            </select>
+          )}
           <button
             type="button"
             onClick={() => downloadAuthenticatedBlob('/reports/export/csv', 'faculty_feedback_report.csv')}
@@ -122,8 +273,8 @@ export function FacultyDashboardView({ isDark }: { isDark: boolean }) {
         </div>
       </div>
 
-      {/* Metrics Strip */}
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+      {/* Metrics Strip (Satisfaction, Online Requests Given vs Completed, Teaching & Knowledge) */}
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-5">
         <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#111C2E]">
           <p className="text-xs text-slate-500 dark:text-slate-400">Satisfaction Index</p>
           <p className="mt-1 font-mono text-2xl font-bold text-[#1E40AF] tabular-nums dark:text-blue-400">
@@ -131,9 +282,21 @@ export function FacultyDashboardView({ isDark }: { isDark: boolean }) {
           </p>
         </div>
         <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#111C2E]">
-          <p className="text-xs text-slate-500 dark:text-slate-400">Authorized Responses</p>
+          <p className="text-xs text-slate-500 dark:text-slate-400">Online Requests Given</p>
           <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums dark:text-white">
+            {data.requestStats?.total_requests ?? 0}
+          </p>
+          <p className="mt-0.5 font-mono text-[11px] text-slate-500 dark:text-slate-400">
+            {data.requestStats?.completed_requests ?? 0} done · {data.requestStats?.pending_requests ?? 0} pending
+          </p>
+        </div>
+        <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#111C2E]">
+          <p className="text-xs text-slate-500 dark:text-slate-400">Submitted Reviews</p>
+          <p className="mt-1 font-mono text-2xl font-bold text-emerald-600 tabular-nums dark:text-emerald-400">
             {data.metrics.total_responses}
+          </p>
+          <p className="mt-0.5 font-mono text-[11px] text-slate-500 dark:text-slate-400">
+            {data.requestStats?.completion_rate ?? 0}% request rate
           </p>
         </div>
         <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#111C2E]">
@@ -143,37 +306,484 @@ export function FacultyDashboardView({ isDark }: { isDark: boolean }) {
           </p>
         </div>
         <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#111C2E]">
-          <p className="text-xs text-slate-500 dark:text-slate-400">Subject Knowledge</p>
+          <p className="text-xs text-slate-500 dark:text-slate-400">Proctor Mentees</p>
           <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums dark:text-white">
-            {data.metrics.avg_knowledge ?? '—'} / 5
+            {data.proctorMentees?.length ?? 0}
+          </p>
+          <p className="mt-0.5 font-mono text-[11px] text-slate-500 dark:text-slate-400">
+            {data.proctorSubjectAnalysis?.length ?? 0} subjects tracked
           </p>
         </div>
       </div>
 
+      {/* Section View Switcher */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 pb-3 dark:border-slate-800">
+        {(
+          [
+            { id: 'all', label: 'All Faculty & Proctor Views' },
+            { id: 'polls', label: `Polls & Online Reviews (${(data.subjectPolls?.length ?? 0) + data.anonymizedComments.length})` },
+            { id: 'proctor', label: `Proctor Subject Analysis (${data.proctorMentees?.length ?? 0} Mentees)` },
+            { id: 'students', label: `Saved Student Database (${data.studentDatabase?.length ?? 0})` },
+          ] as const
+        ).map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => setActiveTab(tab.id)}
+            className={`rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-colors ${
+              activeTab === tab.id
+                ? 'bg-[#1E40AF] text-white dark:bg-blue-600'
+                : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-[#111C2E] dark:text-slate-200 dark:hover:bg-slate-800'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Dispatch Online Feedback Requests Form */}
+      {activeTab === 'all' && (
+        <form
+          onSubmit={handleDispatchRequests}
+          className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111C2E]"
+        >
+          <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-center">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                Send Online Feedback Requests to Students
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Persist online evaluation requests for subject students or your assigned proctor mentees.
+              </p>
+            </div>
+            {dispatchMsg && (
+              <span className="font-mono text-xs font-medium text-emerald-700 dark:text-emerald-400">
+                {dispatchMsg}
+              </span>
+            )}
+          </div>
+          <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-12">
+            <select
+              value={dispatchForm.form_id}
+              onChange={(e) => setDispatchForm((f) => ({ ...f, form_id: e.target.value }))}
+              aria-label="Campaign Form"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs md:col-span-3 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+            >
+              {(data.activeForms ?? []).map((fm) => (
+                <option key={fm.id} value={String(fm.id)}>
+                  {fm.title}
+                </option>
+              ))}
+            </select>
+            <select
+              value={dispatchForm.subject_id}
+              onChange={(e) => setDispatchForm((f) => ({ ...f, subject_id: e.target.value }))}
+              aria-label="Assigned Subject"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs md:col-span-3 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+            >
+              {data.assignedSubjects.map((sub) => (
+                <option key={sub.id} value={String(sub.id)}>
+                  {sub.code} · {sub.name}
+                </option>
+              ))}
+            </select>
+            <select
+              value={dispatchForm.target_scope}
+              onChange={(e) =>
+                setDispatchForm((f) => ({
+                  ...f,
+                  target_scope: e.target.value as 'subject_students' | 'proctor_mentees' | 'all_dept_students',
+                }))
+              }
+              aria-label="Target Students"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs md:col-span-2 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+            >
+              <option value="subject_students">Subject Semester Students</option>
+              <option value="proctor_mentees">My Proctor Mentees</option>
+              <option value="all_dept_students">All Department Students</option>
+            </select>
+            <input
+              type="text"
+              value={dispatchForm.request_note}
+              onChange={(e) => setDispatchForm((f) => ({ ...f, request_note: e.target.value }))}
+              placeholder="Instruction note for students..."
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs md:col-span-2 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+            />
+            <button
+              type="submit"
+              disabled={dispatchBusy || data.assignedSubjects.length === 0}
+              className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-[#1E40AF] px-3 py-2 text-xs font-semibold text-white hover:bg-[#1E3A8A] disabled:opacity-60 md:col-span-2 dark:bg-blue-600"
+            >
+              <Send className="h-3.5 w-3.5" />
+              {dispatchBusy ? 'Sending...' : 'Send Requests'}
+            </button>
+          </div>
+        </form>
+      )}
+
       {/* Assigned Subjects & Semester Trend */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-        <div className="rounded-xl border border-slate-200 bg-white p-5 lg:col-span-6 dark:border-slate-800 dark:bg-[#111C2E]">
-          <h3 className="text-base font-semibold text-slate-900 dark:text-white">Assigned Subjects &amp; Courses</h3>
+      {activeTab === 'all' && (
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+          <div className="rounded-xl border border-slate-200 bg-white p-5 lg:col-span-7 dark:border-slate-800 dark:bg-[#111C2E]">
+            <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+              Assigned Subjects &amp; Online Feedback Requests
+            </h3>
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 text-slate-500 dark:border-slate-800 dark:text-slate-400">
+                    <th className="py-2 font-medium">Subject</th>
+                    <th className="py-2 font-medium">Sem</th>
+                    <th className="py-2 text-right font-medium">Requests</th>
+                    <th className="py-2 text-right font-medium">Completed</th>
+                    <th className="py-2 text-right font-medium">Pending</th>
+                    <th className="py-2 text-right font-medium">Reviews</th>
+                    <th className="py-2 text-right font-medium">Mean</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {data.assignedSubjects.map((sub) => (
+                    <tr key={sub.id}>
+                      <td className="py-2.5 pr-3 font-medium text-slate-900 dark:text-slate-100">
+                        <span className="font-mono text-slate-500">{sub.code}</span> · {sub.name}
+                      </td>
+                      <td className="py-2.5 pr-3 text-slate-600 dark:text-slate-300">{sub.semester_name}</td>
+                      <td className="py-2.5 pr-3 text-right font-mono tabular-nums">{sub.requests_sent ?? 0}</td>
+                      <td className="py-2.5 pr-3 text-right font-mono font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
+                        {sub.completed_requests ?? 0}
+                      </td>
+                      <td className="py-2.5 pr-3 text-right font-mono tabular-nums text-amber-600 dark:text-amber-400">
+                        {sub.pending_requests ?? 0}
+                      </td>
+                      <td className="py-2.5 pr-3 text-right font-mono tabular-nums">{sub.response_count}</td>
+                      <td className="py-2.5 text-right font-mono font-semibold tabular-nums text-[#1E40AF] dark:text-blue-400">
+                        {sub.avg_satisfaction ? sub.avg_satisfaction.toFixed(2) : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="lg:col-span-5">
+            <ChartCard
+              title="Semester-over-Semester Trend"
+              subtitle="Comparison across academic terms"
+              isDark={isDark}
+              config={{
+                type: 'line',
+                data: {
+                  labels: data.semesterTrend.map((t) => t.semester_name),
+                  datasets: [
+                    {
+                      label: 'Average Satisfaction (1-5)',
+                      data: data.semesterTrend.map((t) => t.avg_satisfaction),
+                      borderColor: '#1E40AF',
+                      backgroundColor: 'rgba(30, 64, 175, 0.15)',
+                      fill: true,
+                      tension: 0.3,
+                    },
+                  ],
+                },
+                options: { scales: { y: { min: 0, max: 5 } } },
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Assigned Instructor Polls & Online Reviews */}
+      {(activeTab === 'all' || activeTab === 'polls') && (
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+          <div className="rounded-xl border border-slate-200 bg-white p-5 lg:col-span-5 dark:border-slate-800 dark:bg-[#111C2E]">
+            <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+              Assigned Instructor Polls &amp; Survey Breakdown
+            </h3>
+            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+              Live poll tallies from student responses across your assigned subjects.
+            </p>
+            <div className="mt-4 space-y-4">
+              {(data.subjectPolls?.length ?? 0) === 0 ? (
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  No poll responses recorded for this instructor yet.
+                </p>
+              ) : (
+                data.subjectPolls!.map((poll) => (
+                  <div key={poll.question_id} className="rounded-lg border border-slate-200 p-3.5 dark:border-slate-800">
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">{poll.question_text}</p>
+                      <span className="shrink-0 font-mono text-[11px] text-[#1E40AF] dark:text-blue-400">
+                        {poll.total_votes} votes{poll.avg_score ? ` · ${poll.avg_score}/5` : ''}
+                      </span>
+                    </div>
+                    <p className="mt-0.5 text-[11px] text-slate-500">{poll.category}</p>
+                    <div className="mt-2.5 space-y-1.5">
+                      {poll.options.map((opt) => (
+                        <div key={opt.label} className="space-y-0.5">
+                          <div className="flex justify-between text-[11px]">
+                            <span className="text-slate-700 dark:text-slate-300">{opt.label}</span>
+                            <span className="font-mono tabular-nums text-slate-600 dark:text-slate-300">
+                              {opt.count} ({opt.percentage}%)
+                            </span>
+                          </div>
+                          <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                            <div
+                              className="h-full rounded-full bg-[#1E40AF] dark:bg-blue-500"
+                              style={{ width: `${opt.percentage}%` }}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-white p-5 lg:col-span-7 dark:border-slate-800 dark:bg-[#111C2E]">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+                Online Reviews for Assigned Subject Faculty
+              </h3>
+              <span className="flex items-center gap-1 text-xs text-slate-500">
+                <ShieldCheck className="h-3.5 w-3.5 text-[#1E40AF] dark:text-blue-400" />
+                Anonymous Flags Enforced
+              </span>
+            </div>
+            <div className="mt-4 divide-y divide-slate-200 dark:divide-slate-800">
+              {data.anonymizedComments.length === 0 ? (
+                <p className="py-4 text-xs text-slate-500">No student reviews submitted yet.</p>
+              ) : (
+                data.anonymizedComments.map((c) => (
+                  <div key={c.id} className="py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+                      <span>
+                        <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">
+                          {c.subject_code}
+                        </span>{' '}
+                        · {c.subject_name}
+                        {c.semester_name ? ` (${c.semester_name})` : ''} ·{' '}
+                        <span className="font-medium text-[#1E40AF] dark:text-blue-400">
+                          {c.respondent_display || 'Anonymous Respondent'}
+                        </span>
+                      </span>
+                      <span className="font-mono font-semibold text-slate-800 dark:text-slate-200">
+                        {c.overall_satisfaction.toFixed(1)} / 5
+                        {c.sentiment ? ` · ${c.sentiment}` : ''}
+                      </span>
+                    </div>
+                    <p className="mt-1.5 text-sm text-slate-700 dark:text-slate-200">{c.comment_text}</p>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Proctor Subject Analysis, Mentees & Mentee Reviews */}
+      {(activeTab === 'all' || activeTab === 'proctor') && (
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+            <div className="rounded-xl border border-slate-200 bg-white p-5 lg:col-span-6 dark:border-slate-800 dark:bg-[#111C2E]">
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+                Proctor Subject-Wise Analysis (Mentee Evaluations)
+              </h3>
+              <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                How your assigned proctor mentees rated their courses, instructors, and labs.
+              </p>
+              <div className="mt-4 overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-200 text-slate-500 dark:border-slate-800 dark:text-slate-400">
+                      <th className="py-2 font-medium">Subject &amp; Instructor</th>
+                      <th className="py-2 text-right font-medium">Reqs</th>
+                      <th className="py-2 text-right font-medium">Reviews</th>
+                      <th className="py-2 text-right font-medium">Teach</th>
+                      <th className="py-2 text-right font-medium">Mean</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                    {(data.proctorSubjectAnalysis ?? []).length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="py-6 text-center text-slate-500">
+                          No proctor subject reviews recorded yet.
+                        </td>
+                      </tr>
+                    ) : (
+                      data.proctorSubjectAnalysis!.map((row) => (
+                        <tr key={row.subject_id}>
+                          <td className="py-2.5 pr-3">
+                            <p className="font-medium text-slate-900 dark:text-slate-100">
+                              <span className="font-mono text-[#1E40AF] dark:text-blue-400">{row.subject_code}</span> ·{' '}
+                              {row.subject_name}
+                            </p>
+                            <p className="text-[11px] text-slate-500">
+                              {row.semester_name} · {row.instructor_name || 'Department Faculty'}
+                            </p>
+                          </td>
+                          <td className="py-2.5 pr-3 text-right font-mono tabular-nums">{row.requests_count}</td>
+                          <td className="py-2.5 pr-3 text-right font-mono tabular-nums">{row.reviews_count}</td>
+                          <td className="py-2.5 pr-3 text-right font-mono tabular-nums">
+                            {row.avg_teaching ? row.avg_teaching.toFixed(1) : '—'}
+                          </td>
+                          <td className="py-2.5 text-right font-mono font-semibold tabular-nums text-[#1E40AF] dark:text-blue-400">
+                            {row.avg_overall ? row.avg_overall.toFixed(2) : '—'}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 bg-white p-5 lg:col-span-6 dark:border-slate-800 dark:bg-[#111C2E]">
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+                My Proctor Mentees ({data.proctorMentees?.length ?? 0})
+              </h3>
+              <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                Saved student records assigned to you as proctor with online request completion counts.
+              </p>
+              <div className="mt-4 overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-200 text-slate-500 dark:border-slate-800 dark:text-slate-400">
+                      <th className="py-2 font-medium">SRN</th>
+                      <th className="py-2 font-medium">Student</th>
+                      <th className="py-2 font-medium">Sem</th>
+                      <th className="py-2 text-right font-medium">Reqs</th>
+                      <th className="py-2 text-right font-medium">Done</th>
+                      <th className="py-2 text-right font-medium">Pending</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                    {(data.proctorMentees ?? []).length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="py-6 text-center text-slate-500">
+                          No mentees currently assigned.
+                        </td>
+                      </tr>
+                    ) : (
+                      data.proctorMentees!.map((m) => (
+                        <tr key={m.student_id}>
+                          <td className="py-2.5 pr-3 font-mono font-semibold text-[#1E40AF] dark:text-blue-400">
+                            {m.roll_number}
+                          </td>
+                          <td className="py-2.5 pr-3">
+                            <p className="font-medium text-slate-900 dark:text-slate-100">{m.full_name}</p>
+                            <p className="font-mono text-[10px] text-slate-500">{m.department_code}</p>
+                          </td>
+                          <td className="py-2.5 pr-3 text-slate-600 dark:text-slate-300">{m.semester_name}</td>
+                          <td className="py-2.5 pr-3 text-right font-mono tabular-nums">{m.requests_given}</td>
+                          <td className="py-2.5 pr-3 text-right font-mono font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
+                            {m.feedbacks_completed}
+                          </td>
+                          <td className="py-2.5 text-right font-mono tabular-nums text-amber-600 dark:text-amber-400">
+                            {m.feedbacks_pending}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          {(data.proctorReviews?.length ?? 0) > 0 && (
+            <div className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111C2E]">
+              <div className="flex items-center justify-between">
+                <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+                  Proctor Mentee Reviews Across Subjects
+                </h3>
+                <span className="text-xs text-slate-500">Anonymous submissions protect student identity</span>
+              </div>
+              <div className="mt-4 divide-y divide-slate-200 dark:divide-slate-800">
+                {data.proctorReviews!.slice(0, 10).map((rev) => (
+                  <div key={rev.id} className="py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+                      <span>
+                        <span className="font-mono font-semibold text-slate-800 dark:text-slate-200">
+                          {rev.subject_code}
+                        </span>{' '}
+                        · {rev.subject_name} · Faculty: {rev.instructor_name || 'Department Faculty'} ·{' '}
+                        <span className="font-medium text-[#1E40AF] dark:text-blue-400">
+                          {rev.respondent_display}
+                        </span>
+                      </span>
+                      <span className="font-mono font-semibold text-slate-900 dark:text-slate-100">
+                        {rev.overall_satisfaction.toFixed(1)} / 5
+                      </span>
+                    </div>
+                    <p className="mt-1 text-sm text-slate-700 dark:text-slate-200">{rev.comment_text}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Full Saved Student Database (Faculty View) */}
+      {(activeTab === 'all' || activeTab === 'students') && (
+        <div className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111C2E]">
+          <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+            <div>
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+                Saved Student Database ({filteredStudentDb.length} Students)
+              </h3>
+              <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                Complete university student database with 4-digit SRN, department, semester (1–8), assigned proctor, and request completion counts.
+              </p>
+            </div>
+            <input
+              type="search"
+              value={studentSearch}
+              onChange={(e) => setStudentSearch(e.target.value)}
+              placeholder="Search SRN, student, dept, or proctor..."
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs sm:w-64 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+            />
+          </div>
           <div className="mt-4 overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead>
                 <tr className="border-b border-slate-200 text-slate-500 dark:border-slate-800 dark:text-slate-400">
-                  <th className="py-2 font-medium">Subject</th>
+                  <th className="py-2 font-medium">SRN</th>
+                  <th className="py-2 font-medium">Student Name</th>
+                  <th className="py-2 font-medium">Dept &amp; Program</th>
                   <th className="py-2 font-medium">Semester</th>
-                  <th className="py-2 text-right font-medium">Responses</th>
-                  <th className="py-2 text-right font-medium">Mean</th>
+                  <th className="py-2 font-medium">Assigned Proctor</th>
+                  <th className="py-2 text-right font-medium">Requests</th>
+                  <th className="py-2 text-right font-medium">Completed</th>
+                  <th className="py-2 text-right font-medium">Pending</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {data.assignedSubjects.map((sub) => (
-                  <tr key={sub.id}>
-                    <td className="py-2.5 pr-3 font-medium text-slate-900 dark:text-slate-100">
-                      <span className="font-mono text-slate-500">{sub.code}</span> · {sub.name}
+                {filteredStudentDb.map((stu) => (
+                  <tr key={stu.student_id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                    <td className="py-2.5 pr-3 font-mono font-semibold text-[#1E40AF] dark:text-blue-400">
+                      {stu.roll_number}
                     </td>
-                    <td className="py-2.5 pr-3 text-slate-600 dark:text-slate-300">{sub.semester_name}</td>
-                    <td className="py-2.5 pr-3 text-right font-mono tabular-nums">{sub.response_count}</td>
-                    <td className="py-2.5 text-right font-mono font-semibold tabular-nums text-[#1E40AF] dark:text-blue-400">
-                      {sub.avg_satisfaction ? sub.avg_satisfaction.toFixed(2) : '—'}
+                    <td className="py-2.5 pr-3">
+                      <p className="font-medium text-slate-900 dark:text-slate-100">{stu.full_name}</p>
+                      <p className="font-mono text-[10px] text-slate-500">{stu.email}</p>
+                    </td>
+                    <td className="py-2.5 pr-3 text-slate-600 dark:text-slate-300">
+                      {stu.department_code} · {stu.course_code}
+                    </td>
+                    <td className="py-2.5 pr-3 font-mono text-slate-700 dark:text-slate-300">{stu.semester_name}</td>
+                    <td className="py-2.5 pr-3 text-slate-700 dark:text-slate-300">
+                      {stu.proctor_name || 'Unassigned'}
+                    </td>
+                    <td className="py-2.5 pr-3 text-right font-mono tabular-nums">{stu.requests_given}</td>
+                    <td className="py-2.5 pr-3 text-right font-mono font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
+                      {stu.feedbacks_completed}
+                    </td>
+                    <td className="py-2.5 text-right font-mono tabular-nums text-amber-600 dark:text-amber-400">
+                      {stu.feedbacks_pending}
                     </td>
                   </tr>
                 ))}
@@ -181,68 +791,15 @@ export function FacultyDashboardView({ isDark }: { isDark: boolean }) {
             </table>
           </div>
         </div>
+      )}
 
-        <div className="lg:col-span-6">
-          <ChartCard
-            title="Semester-over-Semester Trend"
-            subtitle="Comparison across academic terms"
-            isDark={isDark}
-            config={{
-              type: 'line',
-              data: {
-                labels: data.semesterTrend.map((t) => t.semester_name),
-                datasets: [
-                  {
-                    label: 'Average Satisfaction (1-5)',
-                    data: data.semesterTrend.map((t) => t.avg_satisfaction),
-                    borderColor: '#1E40AF',
-                    backgroundColor: 'rgba(30, 64, 175, 0.15)',
-                    fill: true,
-                    tension: 0.3,
-                  },
-                ],
-              },
-              options: { scales: { y: { min: 0, max: 5 } } },
-            }}
-          />
-        </div>
-      </div>
-
-      {/* Privacy-Protected Comments + AI Teaching Recommendations */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-        <div className="rounded-xl border border-slate-200 bg-white p-5 lg:col-span-7 dark:border-slate-800 dark:bg-[#111C2E]">
-          <div className="flex items-center justify-between">
-            <h3 className="text-base font-semibold text-slate-900 dark:text-white">
-              Anonymized Student Feedback Comments
-            </h3>
-            <span className="flex items-center gap-1 text-xs text-slate-500">
-              <ShieldCheck className="h-3.5 w-3.5 text-[#1E40AF] dark:text-blue-400" />
-              Identities Protected
-            </span>
-          </div>
-          <div className="mt-4 divide-y divide-slate-200 dark:divide-slate-800">
-            {data.anonymizedComments.map((c) => (
-              <div key={c.id} className="py-3">
-                <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-                  <span>
-                    {c.subject_code} · {c.subject_name}
-                    {c.primary_category ? ` · ${c.primary_category}` : ''}
-                  </span>
-                  <span className="font-mono font-semibold text-slate-800 dark:text-slate-200">
-                    {c.overall_satisfaction.toFixed(1)} / 5
-                  </span>
-                </div>
-                <p className="mt-1.5 text-sm text-slate-700 dark:text-slate-200">{c.comment_text}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-slate-200 bg-white p-5 lg:col-span-5 dark:border-slate-800 dark:bg-[#111C2E]">
+      {/* AI Teaching Recommendations */}
+      {activeTab === 'all' && (
+        <div className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111C2E]">
           <h3 className="text-base font-semibold text-slate-900 dark:text-white">
             AI Teaching Improvement Suggestions
           </h3>
-          <div className="mt-4 space-y-3">
+          <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
             {data.recommendations.length === 0 ? (
               <p className="text-xs text-slate-500">
                 Run &ldquo;Generate Executive Insights&rdquo; in AI Insights to receive personalized Gemini teaching recommendations.
@@ -257,7 +814,7 @@ export function FacultyDashboardView({ isDark }: { isDark: boolean }) {
             )}
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -1189,6 +1746,9 @@ export function StudentsManagementView({ catalog }: { catalog?: CatalogData | nu
       batch_year: number;
       department_id: number;
       semester_id: number;
+      proctor_faculty_id: number | null;
+      proctor_name: string | null;
+      proctor_employee_code: string | null;
       department_code: string;
       department_name: string;
       course_code: string;
@@ -1196,8 +1756,23 @@ export function StudentsManagementView({ catalog }: { catalog?: CatalogData | nu
       semester_name: string;
       term_order: number;
       submissions_count: number;
+      requests_count: number;
+      completed_requests_count: number;
     }>
   >([]);
+  const [newStudent, setNewStudent] = useState({
+    full_name: '',
+    email: '',
+    password: '',
+    department_id: '1',
+    course_id: '1',
+    semester_id: '5',
+    proctor_faculty_id: '',
+    roll_number: '',
+    batch_year: '2024',
+  });
+  const [stuMsg, setStuMsg] = useState<string | null>(null);
+  const [stuErr, setStuErr] = useState<string | null>(null);
 
   const loadStudents = useCallback(async () => {
     const [stuRes, trackRes] = await Promise.all([
@@ -1211,6 +1786,48 @@ export function StudentsManagementView({ catalog }: { catalog?: CatalogData | nu
   useEffect(() => {
     loadStudents().catch(() => null);
   }, [loadStudents]);
+
+  const deptCourses = (catalog?.courses ?? []).filter(
+    (c) => String(c.department_id) === newStudent.department_id
+  );
+  const selectedNewDept = (catalog?.departments ?? []).find((d) => String(d.id) === newStudent.department_id);
+  const newPrefix = getSuggestedEnrollmentPrefix(selectedNewDept?.code, Number(newStudent.batch_year) || 2024);
+
+  async function addStudentRecord(e: FormEvent) {
+    e.preventDefault();
+    setStuMsg(null);
+    setStuErr(null);
+    try {
+      const res = await apiRequest<{ roll_number: string; message: string }>('/admin/students', {
+        method: 'POST',
+        body: JSON.stringify({
+          full_name: newStudent.full_name,
+          email: newStudent.email,
+          password: newStudent.password || undefined,
+          department_id: Number(newStudent.department_id),
+          course_id: Number(newStudent.course_id),
+          semester_id: Number(newStudent.semester_id),
+          proctor_faculty_id: newStudent.proctor_faculty_id ? Number(newStudent.proctor_faculty_id) : undefined,
+          roll_number: newStudent.roll_number.trim() ? newStudent.roll_number.trim().toUpperCase() : undefined,
+          batch_year: Number(newStudent.batch_year) || 2024,
+        }),
+      });
+      setNewStudent((s) => ({ ...s, full_name: '', email: '', password: '', roll_number: '' }));
+      setStuMsg(res.message);
+      await loadStudents();
+    } catch (err) {
+      setStuErr(err instanceof Error ? err.message : 'Unable to save student record.');
+    }
+  }
+
+  async function assignStudentProctor(studentId: number, proctorFacultyId: number) {
+    await apiRequest(`/admin/students/${studentId}/proctor`, {
+      method: 'PUT',
+      body: JSON.stringify({ proctor_faculty_id: proctorFacultyId || null }),
+    });
+    setStuMsg('Student proctor assignment updated.');
+    await loadStudents();
+  }
 
   async function toggleStudentStatus(userId: number, currentActive: number) {
     await apiRequest(`/admin/users/${userId}/role`, {
@@ -1241,7 +1858,7 @@ export function StudentsManagementView({ catalog }: { catalog?: CatalogData | nu
               </p>
             </div>
             <span className="font-mono text-xs text-[#1E40AF] dark:text-blue-400">
-              Format: 24SUU[PROGRAM]001
+              Format: 24SUU[PROGRAM]0001
             </span>
           </div>
 
@@ -1269,7 +1886,7 @@ export function StudentsManagementView({ catalog }: { catalog?: CatalogData | nu
                       <p className="text-[11px] text-slate-500 dark:text-slate-400">{dept.head_name}</p>
                     </td>
                     <td className="py-2.5 pr-3 font-mono font-semibold text-[#1E40AF] dark:text-blue-400">
-                      {dept.program_prefix}001
+                      {dept.program_prefix}0001
                     </td>
                     {dept.semesters.map((cell) => {
                       const hasActivity =
@@ -1309,13 +1926,117 @@ export function StudentsManagementView({ catalog }: { catalog?: CatalogData | nu
         </div>
       )}
 
+      {/* Save New Student Record (4-Digit SRN & Proctor) */}
+      <form
+        onSubmit={addStudentRecord}
+        className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-[#111C2E]"
+      >
+        <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-center">
+          <div>
+            <h3 className="flex items-center gap-2 text-base font-semibold text-slate-900 dark:text-white">
+              <UserPlus className="h-4 w-4 text-[#1E40AF] dark:text-blue-400" />
+              Save Student Database Record (4-Digit SRN)
+            </h3>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Create persistent student records with auto-sequenced 4-digit SRN ({newPrefix}0001), semester (1–8), and assigned proctor.
+            </p>
+          </div>
+          {stuMsg && <span className="text-xs font-medium text-emerald-700 dark:text-emerald-400">{stuMsg}</span>}
+          {stuErr && <span className="text-xs font-medium text-red-600 dark:text-red-400">{stuErr}</span>}
+        </div>
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-4">
+          <input
+            type="text"
+            required
+            placeholder="Student Full Name"
+            value={newStudent.full_name}
+            onChange={(e) => setNewStudent((s) => ({ ...s, full_name: e.target.value }))}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+          />
+          <input
+            type="email"
+            required
+            placeholder="student@sapthagiri.edu"
+            value={newStudent.email}
+            onChange={(e) => setNewStudent((s) => ({ ...s, email: e.target.value }))}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+          />
+          <input
+            type="text"
+            placeholder={`SRN (optional, e.g. ${newPrefix}0042)`}
+            value={newStudent.roll_number}
+            onChange={(e) => setNewStudent((s) => ({ ...s, roll_number: e.target.value.toUpperCase() }))}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+          />
+          <select
+            value={newStudent.department_id}
+            onChange={(e) => {
+              const nextDeptId = e.target.value;
+              const matchingCourse = (catalog?.courses ?? []).find((c) => String(c.department_id) === nextDeptId);
+              setNewStudent((s) => ({
+                ...s,
+                department_id: nextDeptId,
+                course_id: matchingCourse ? String(matchingCourse.id) : s.course_id,
+              }));
+            }}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+          >
+            {(catalog?.departments ?? []).map((d) => (
+              <option key={d.id} value={String(d.id)}>
+                {d.code} · {d.name}
+              </option>
+            ))}
+          </select>
+          <select
+            value={newStudent.course_id}
+            onChange={(e) => setNewStudent((s) => ({ ...s, course_id: e.target.value }))}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+          >
+            {(deptCourses.length > 0 ? deptCourses : catalog?.courses ?? []).map((c) => (
+              <option key={c.id} value={String(c.id)}>
+                {c.code} · {c.name}
+              </option>
+            ))}
+          </select>
+          <select
+            value={newStudent.semester_id}
+            onChange={(e) => setNewStudent((s) => ({ ...s, semester_id: e.target.value }))}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+          >
+            {(catalog?.semesters ?? tracking?.semesters ?? []).map((sem) => (
+              <option key={sem.id} value={String(sem.id)}>
+                {sem.name}
+              </option>
+            ))}
+          </select>
+          <select
+            value={newStudent.proctor_faculty_id}
+            onChange={(e) => setNewStudent((s) => ({ ...s, proctor_faculty_id: e.target.value }))}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+          >
+            <option value="">Auto-Assign Dept Proctor</option>
+            {(catalog?.teachers ?? []).map((t) => (
+              <option key={t.id} value={String(t.id)}>
+                Proctor: {t.full_name}
+              </option>
+            ))}
+          </select>
+          <button
+            type="submit"
+            className="rounded-lg bg-[#1E40AF] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E3A8A] dark:bg-blue-600"
+          >
+            Save Student to DB
+          </button>
+        </div>
+      </form>
+
       {/* Student Enrollment Registry */}
       <div className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-[#111C2E]">
         <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
           <div>
             <h2 className="text-base font-semibold text-slate-900 dark:text-white">Student Enrollment Registry</h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Search students by 24SUU enrollment ID, filter by department or semester (1–8), and manage portal access.
+              Search students by 4-digit 24SUU SRN, assign proctors, inspect feedback request completion, and manage portal access.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1347,7 +2068,7 @@ export function StudentsManagementView({ catalog }: { catalog?: CatalogData | nu
               type="search"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search name, 24SUU ID, or email..."
+              placeholder="Search name, 24SUU SRN, or email..."
               className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs sm:w-64 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
             />
           </div>
@@ -1357,10 +2078,12 @@ export function StudentsManagementView({ catalog }: { catalog?: CatalogData | nu
           <table className="w-full text-left text-xs">
             <thead>
               <tr className="border-b border-slate-200 text-slate-500 dark:border-slate-800 dark:text-slate-400">
-                <th className="py-2 font-medium">Enrollment ID</th>
+                <th className="py-2 font-medium">Enrollment SRN</th>
                 <th className="py-2 font-medium">Student Name</th>
                 <th className="py-2 font-medium">Department &amp; Course</th>
                 <th className="py-2 font-medium">Semester</th>
+                <th className="py-2 font-medium">Assigned Proctor</th>
+                <th className="py-2 text-right font-medium">Requests</th>
                 <th className="py-2 text-right font-medium">Submissions</th>
                 <th className="py-2 text-right font-medium">Access</th>
               </tr>
@@ -1377,6 +2100,24 @@ export function StudentsManagementView({ catalog }: { catalog?: CatalogData | nu
                     {s.department_name} · {s.course_code || s.course_name}
                   </td>
                   <td className="py-2.5 pr-3 font-mono text-slate-700 dark:text-slate-300">{s.semester_name}</td>
+                  <td className="py-2.5 pr-3">
+                    <select
+                      value={s.proctor_faculty_id ? String(s.proctor_faculty_id) : ''}
+                      onChange={(e) => assignStudentProctor(s.id, Number(e.target.value))}
+                      aria-label={`Assign proctor for ${s.roll_number}`}
+                      className="rounded border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+                    >
+                      <option value="">Unassigned</option>
+                      {(catalog?.teachers ?? []).map((t) => (
+                        <option key={t.id} value={String(t.id)}>
+                          {t.full_name}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className="py-2.5 pr-3 text-right font-mono tabular-nums">
+                    {s.completed_requests_count ?? 0}/{s.requests_count ?? 0}
+                  </td>
                   <td className="py-2.5 pr-3 text-right font-mono tabular-nums">{s.submissions_count}</td>
                   <td className="py-2.5 text-right">
                     <button
@@ -1597,6 +2338,7 @@ export function ProfileSettingsView({
   const [courseId, setCourseId] = useState<number>(1);
   const [semesterId, setSemesterId] = useState<number>(5);
   const [batchYear, setBatchYear] = useState<number>(2024);
+  const [proctorLabel, setProctorLabel] = useState<string>('');
   const [tracking, setTracking] = useState<SemesterTrackingItem[]>([]);
 
   const [msg, setMsg] = useState<string | null>(null);
@@ -1617,6 +2359,11 @@ export function ProfileSettingsView({
           setFullName(res.profile.full_name);
           setPhone(res.profile.phone || '');
           setLanguage(res.profile.preferred_language || 'en');
+          setProctorLabel(
+            res.profile.proctor_name
+              ? `${res.profile.proctor_name}${res.profile.proctor_employee_code ? ` (${res.profile.proctor_employee_code})` : ''}`
+              : 'Department Proctor'
+          );
         }
         setTracking(res.eightSemesterTracking || []);
       })
@@ -1642,7 +2389,7 @@ export function ProfileSettingsView({
 
     if (user.role === 'student') {
       if (!normalizedRoll || !isValidEnrollmentFormat(normalizedRoll)) {
-        setErrMsg(`Enrollment number must follow the ${suggestedPrefix}001 format (e.g. ${suggestedPrefix}001).`);
+        setErrMsg(`Enrollment number (SRN) must follow the ${suggestedPrefix}0001 format (e.g. ${suggestedPrefix}0001).`);
         return;
       }
       try {
@@ -1738,21 +2485,21 @@ export function ProfileSettingsView({
                 Academic Enrollment &amp; Semester Details
               </h3>
               <span className="font-mono text-[11px] text-[#1E40AF] dark:text-blue-400">
-                Format: {suggestedPrefix}001
+                Format: {suggestedPrefix}0001
               </span>
             </div>
 
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div>
                 <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">
-                  Enrollment Number
+                  Enrollment Number / SRN (4-Digit)
                 </label>
                 <input
                   type="text"
                   required
                   value={rollNumber}
                   onChange={(e) => setRollNumber(e.target.value.toUpperCase())}
-                  placeholder={`${suggestedPrefix}001`}
+                  placeholder={`${suggestedPrefix}0001`}
                   className={`mt-1 w-full rounded-lg border bg-white px-3 py-2 font-mono text-sm dark:bg-slate-900 dark:text-white ${
                     isRollInvalid
                       ? 'border-red-500'
@@ -1761,7 +2508,7 @@ export function ProfileSettingsView({
                 />
                 {isRollInvalid && (
                   <p className="mt-1 text-[11px] text-red-600 dark:text-red-400">
-                    Must match 24SUUBECS001 pattern (YY + SUU + Program + 3 digits).
+                    Must match 24SUUBECS0001 pattern (YY + SUU + Program + 4 digits).
                   </p>
                 )}
               </div>
@@ -1809,7 +2556,7 @@ export function ProfileSettingsView({
                   ))}
                 </select>
               </div>
-              <div className="sm:col-span-2">
+              <div>
                 <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">
                   Enrolled Semester (1 – 8)
                 </label>
@@ -1824,6 +2571,17 @@ export function ProfileSettingsView({
                     </option>
                   ))}
                 </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Assigned Proctor
+                </label>
+                <input
+                  type="text"
+                  disabled
+                  value={proctorLabel || 'Assigned automatically by department'}
+                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-900/50 dark:text-slate-300"
+                />
               </div>
             </div>
           </div>

@@ -168,7 +168,7 @@ export function LandingAndAuth({
     setErrorMsg(null);
     if (normalizedRollInput && !isValidEnrollmentFormat(normalizedRollInput)) {
       setErrorMsg(
-        `Enrollment number must follow the ${suggestedPrefix}001 format (e.g. ${suggestedPrefix}104).`
+        `Enrollment number (SRN) must follow the ${suggestedPrefix}0001 format (e.g. ${suggestedPrefix}0042).`
       );
       return;
     }
@@ -562,13 +562,13 @@ export function LandingAndAuth({
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                      Enrollment Number (24SUU Format)
+                      Enrollment Number / SRN (4-Digit 24SUU Format)
                     </label>
                     <input
                       type="text"
                       value={rollNumber}
                       onChange={(e) => setRollNumber(e.target.value.toUpperCase())}
-                      placeholder={`${suggestedPrefix}104`}
+                      placeholder={`${suggestedPrefix}0042`}
                       className={`mt-1 w-full rounded-lg border bg-white px-3 py-2 font-mono text-sm text-slate-900 focus:outline-none dark:bg-slate-900 dark:text-white ${
                         isRollInvalid
                           ? 'border-red-500 focus:border-red-500'
@@ -581,8 +581,8 @@ export function LandingAndAuth({
                       }`}
                     >
                       {isRollInvalid
-                        ? `Invalid format. Expected e.g. ${suggestedPrefix}001 (Year + SUU + Program + 3 digits).`
-                        : `Expected: ${suggestedPrefix}001 · Leave blank to auto-assign`}
+                        ? `Invalid format. Expected e.g. ${suggestedPrefix}0001 (Year + SUU + Program + 4 digits).`
+                        : `Expected: ${suggestedPrefix}0001 · Leave blank to auto-assign`}
                     </p>
                   </div>
                 </div>
@@ -726,7 +726,7 @@ export function LandingAndAuth({
                         required
                         value={email}
                         onChange={(e) => setEmail(e.target.value)}
-                        placeholder={page === 'student-login' ? 'student@meridian.edu' : 'admin@meridian.edu'}
+                        placeholder={page === 'student-login' ? 'student@sapthagiri.edu' : 'admin@sapthagiri.edu'}
                         className="w-full rounded-lg border border-slate-300 bg-white pl-9 pr-3 py-2 text-sm text-slate-900 focus:border-[#1E40AF] focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white"
                       />
                     </div>

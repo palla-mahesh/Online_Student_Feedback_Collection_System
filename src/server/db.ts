@@ -108,8 +108,9 @@ export function initSchema(): void {
       course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE RESTRICT,
       academic_year_id INTEGER NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
       semester_id INTEGER NOT NULL REFERENCES semesters(id) ON DELETE RESTRICT,
+      proctor_faculty_id INTEGER REFERENCES faculty(id) ON DELETE SET NULL,
       roll_number TEXT NOT NULL UNIQUE,
-      batch_year INTEGER NOT NULL DEFAULT 2025,
+      batch_year INTEGER NOT NULL DEFAULT 2024,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -268,6 +269,22 @@ export function initSchema(): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS feedback_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      form_id INTEGER NOT NULL REFERENCES feedback_forms(id) ON DELETE CASCADE,
+      student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+      subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+      faculty_id INTEGER REFERENCES faculty(id) ON DELETE SET NULL,
+      proctor_faculty_id INTEGER REFERENCES faculty(id) ON DELETE SET NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'in_progress', 'completed')),
+      requested_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      request_note TEXT NOT NULL DEFAULT '',
+      requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(form_id, student_id, subject_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_submissions_form ON feedback_submissions(form_id);
     CREATE INDEX IF NOT EXISTS idx_submissions_student ON feedback_submissions(student_id);
     CREATE INDEX IF NOT EXISTS idx_submissions_subject ON feedback_submissions(subject_id);
@@ -275,6 +292,10 @@ export function initSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_subjects_dept ON subjects(department_id);
     CREATE INDEX IF NOT EXISTS idx_ai_sentiment_cat ON ai_sentiment_analysis(primary_category);
     CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_fb_requests_faculty ON feedback_requests(faculty_id);
+    CREATE INDEX IF NOT EXISTS idx_fb_requests_proctor ON feedback_requests(proctor_faculty_id);
+    CREATE INDEX IF NOT EXISTS idx_fb_requests_student ON feedback_requests(student_id);
+    CREATE INDEX IF NOT EXISTS idx_fb_requests_subject ON feedback_requests(subject_id);
   `);
 
   // Idempotent column migrations for pre-existing SQLite files
@@ -292,6 +313,12 @@ export function initSchema(): void {
   if (!submissionColNames.has('receipt_token')) {
     db.exec(`ALTER TABLE feedback_submissions ADD COLUMN receipt_token TEXT;`);
   }
+
+  const studentCols = db.prepare(`PRAGMA table_info(students)`).all() as Array<{ name: string }>;
+  const studentColNames = new Set(studentCols.map((c) => c.name));
+  if (!studentColNames.has('proctor_faculty_id')) {
+    db.exec(`ALTER TABLE students ADD COLUMN proctor_faculty_id INTEGER REFERENCES faculty(id) ON DELETE SET NULL;`);
+  }
 }
 
 function ensureSapthagiriCurriculumSynced(): void {
@@ -303,20 +330,26 @@ function ensureSapthagiriCurriculumSynced(): void {
       `UPDATE users SET full_name = 'Dr. H. Ramakrishna' WHERE email = 'admin@meridian.edu' AND full_name = 'Dr. Eleanor Vance'`
     ).run();
 
-    // 2. Migrate existing MSU and 24SOU roll numbers to 24SUUBECS001 format
+    // 2. Migrate existing MSU, 24SOU, and 3-digit 24SUU roll numbers to 4-digit SRN sequence (24SUUBECS0001)
     const rollMigrations: Array<[string, string]> = [
-      ['MSU2026CS001', '24SUUBECS001'],
-      ['24SOUBECS001', '24SUUBECS001'],
-      ['MSU2026CS002', '24SUUBECS002'],
-      ['24SOUBECS002', '24SUUBECS002'],
-      ['MSU2026EC014', '24SUUBEEC014'],
-      ['24SOUBEEC014', '24SUUBEEC014'],
-      ['MSU2026ME008', '24SUUBEME008'],
-      ['24SOUBEME008', '24SUUBEME008'],
-      ['MSU2026MB011', '24SUUMBTM011'],
-      ['24SOUBEMB011', '24SUUMBTM011'],
-      ['MSU2026CS019', '24SUUBECS019'],
-      ['24SOUBECS019', '24SUUBECS019'],
+      ['MSU2026CS001', '24SUUBECS0001'],
+      ['24SOUBECS001', '24SUUBECS0001'],
+      ['24SUUBECS001', '24SUUBECS0001'],
+      ['MSU2026CS002', '24SUUBECS0002'],
+      ['24SOUBECS002', '24SUUBECS0002'],
+      ['24SUUBECS002', '24SUUBECS0002'],
+      ['MSU2026EC014', '24SUUBEEC0014'],
+      ['24SOUBEEC014', '24SUUBEEC0014'],
+      ['24SUUBEEC014', '24SUUBEEC0014'],
+      ['MSU2026ME008', '24SUUBEME0008'],
+      ['24SOUBEME008', '24SUUBEME0008'],
+      ['24SUUBEME008', '24SUUBEME0008'],
+      ['MSU2026MB011', '24SUUMBTM0011'],
+      ['24SOUBEMB011', '24SUUMBTM0011'],
+      ['24SUUMBTM011', '24SUUMBTM0011'],
+      ['MSU2026CS019', '24SUUBECS0019'],
+      ['24SOUBECS019', '24SUUBECS0019'],
+      ['24SUUBECS019', '24SUUBECS0019'],
     ];
     for (const [oldRoll, newRoll] of rollMigrations) {
       const hasNew = db.prepare('SELECT id FROM students WHERE roll_number = ?').get(newRoll);
@@ -324,15 +357,21 @@ function ensureSapthagiriCurriculumSynced(): void {
         db.prepare('UPDATE students SET roll_number = ?, batch_year = 2024 WHERE roll_number = ?').run(newRoll, oldRoll);
       }
     }
-    // Upgrade any remaining 24SOU* custom registered roll numbers to 24SUU*
-    const legacySouRows = db
-      .prepare(`SELECT id, roll_number FROM students WHERE roll_number LIKE '24SOU%'`)
+    // Upgrade any remaining 24SOU* or 3-digit *SUU* roll numbers to 4-digit 0001 sequence
+    const allStudentRolls = db
+      .prepare(`SELECT id, roll_number FROM students`)
       .all() as Array<{ id: number; roll_number: string }>;
-    for (const row of legacySouRows) {
-      const upgraded = row.roll_number.replace(/^24SOU/, '24SUU');
-      const dup = db.prepare('SELECT id FROM students WHERE roll_number = ?').get(upgraded);
-      if (!dup) {
-        db.prepare('UPDATE students SET roll_number = ? WHERE id = ?').run(upgraded, row.id);
+    for (const row of allStudentRolls) {
+      let upgraded = row.roll_number.trim().toUpperCase().replace(/^(\d{2})SOU/, '$1SUU');
+      const m3 = upgraded.match(/^(\d{2}SUU[A-Z]{2,6})(\d{3})$/);
+      if (m3) {
+        upgraded = `${m3[1]}0${m3[2]}`;
+      }
+      if (upgraded !== row.roll_number) {
+        const dup = db.prepare('SELECT id FROM students WHERE roll_number = ? AND id != ?').get(upgraded, row.id);
+        if (!dup) {
+          db.prepare('UPDATE students SET roll_number = ? WHERE id = ?').run(upgraded, row.id);
+        }
       }
     }
 
@@ -481,30 +520,30 @@ function ensureSapthagiriCurriculumSynced(): void {
     const getCourseId = (code: string) =>
       (db.prepare('SELECT id FROM courses WHERE code = ?').get(code) as { id: number }).id;
 
-    // Ensure main demo student (24SUUBECS001) points to 24BECSE & Semester 5
+    // Ensure main demo students (4-digit SRN) point to 24BECSE & Semester 5
     db.prepare(
       `UPDATE students SET department_id = ?, course_id = ?, academic_year_id = ?, semester_id = ?
-       WHERE roll_number IN ('24SUUBECS001', '24SUUBECS002', '24SUUBECS019')`
+       WHERE roll_number IN ('24SUUBECS0001', '24SUUBECS0002', '24SUUBECS0019')`
     ).run(getDeptId('CSE'), getCourseId('24BECSE'), yr2026, sem5Id);
 
-    // Ensure active campaigns point to Semester 5 and carry clear Sapthagiri names & QR tokens
+    // Ensure active campaigns point to Semester 5 and carry clear Sapthagiri SNPSU names & QR tokens
     db.prepare(`UPDATE feedback_forms SET semester_id = ? WHERE is_active = 1`).run(sem5Id);
 
     const legacyCseForm = db
       .prepare(
-        `SELECT id FROM feedback_forms WHERE qr_token IN ('MSU-FALL26-CSE', 'SNU-SEM5-CSE') OR title = 'Fall 2026 Mid-Semester Teaching & Lab Evaluation' LIMIT 1`
+        `SELECT id FROM feedback_forms WHERE qr_token IN ('MSU-FALL26-CSE', 'SNU-SEM5-CSE', 'SNPSU-SEM5-CSE') OR title = 'Fall 2026 Mid-Semester Teaching & Lab Evaluation' LIMIT 1`
       )
       .get() as { id: number } | undefined;
     if (legacyCseForm) {
       const tokenConflict = db
-        .prepare(`SELECT id FROM feedback_forms WHERE qr_token = 'SNU-SEM5-CSE' AND id != ?`)
+        .prepare(`SELECT id FROM feedback_forms WHERE qr_token = 'SNPSU-SEM5-CSE' AND id != ?`)
         .get(legacyCseForm.id);
       if (!tokenConflict) {
         db.prepare(
           `UPDATE feedback_forms
            SET title = 'Semester 5 CSE Core & Elective Course Evaluation',
-               description = 'Structured evaluation of faculty instruction, cloud and data engineering labs, and Semester 5 elective courses at Sapthagiri NPS University.',
-               qr_token = 'SNU-SEM5-CSE',
+               description = 'Structured evaluation of faculty instruction, cloud and data engineering labs, and Semester 5 elective courses at Sapthagiri NPS University (SNPSU).',
+               qr_token = 'SNPSU-SEM5-CSE',
                is_active = 1,
                updated_at = datetime('now')
            WHERE id = ?`
@@ -514,19 +553,19 @@ function ensureSapthagiriCurriculumSynced(): void {
 
     const legacyCampusForm = db
       .prepare(
-        `SELECT id FROM feedback_forms WHERE qr_token IN ('MSU-FALL26-ALL', 'SNU-SEM5-CAMPUS') OR title = 'University-Wide Campus, Laboratory & Course Feedback (Fall 2026)' LIMIT 1`
+        `SELECT id FROM feedback_forms WHERE qr_token IN ('MSU-FALL26-ALL', 'SNU-SEM5-CAMPUS', 'SNPSU-SEM5-CAMPUS') OR title = 'University-Wide Campus, Laboratory & Course Feedback (Fall 2026)' LIMIT 1`
       )
       .get() as { id: number } | undefined;
     if (legacyCampusForm) {
       const tokenConflict = db
-        .prepare(`SELECT id FROM feedback_forms WHERE qr_token = 'SNU-SEM5-CAMPUS' AND id != ?`)
+        .prepare(`SELECT id FROM feedback_forms WHERE qr_token = 'SNPSU-SEM5-CAMPUS' AND id != ?`)
         .get(legacyCampusForm.id);
       if (!tokenConflict) {
         db.prepare(
           `UPDATE feedback_forms
-           SET title = 'Sapthagiri Campus Facilities & Academic Experience Survey',
-               description = 'University-wide student survey covering smart classrooms, laboratory equipment, library infrastructure, examination clarity, and support services.',
-               qr_token = 'SNU-SEM5-CAMPUS',
+           SET title = 'SNPSU Campus Facilities & Academic Experience Survey',
+               description = 'Sapthagiri NPS University (SNPSU) student survey covering smart classrooms, laboratory equipment, library infrastructure, examination clarity, and support services.',
+               qr_token = 'SNPSU-SEM5-CAMPUS',
                is_active = 1,
                updated_at = datetime('now')
            WHERE id = ?`
@@ -534,13 +573,27 @@ function ensureSapthagiriCurriculumSynced(): void {
       }
     }
 
-    // Backfill receipt_token for any existing submissions so every submission QR works via Google Scan
-    const missingTokenRows = db
-      .prepare(`SELECT id FROM feedback_submissions WHERE receipt_token IS NULL OR receipt_token = ''`)
-      .all() as Array<{ id: number }>;
+    // Upgrade any remaining SNU-* form QR tokens and submission receipt tokens to SNPSU-*
+    const legacyFormTokens = db
+      .prepare(`SELECT id, qr_token FROM feedback_forms WHERE qr_token LIKE 'SNU-%'`)
+      .all() as Array<{ id: number; qr_token: string }>;
+    for (const row of legacyFormTokens) {
+      const nextTok = row.qr_token.replace(/^SNU-/, 'SNPSU-');
+      const dup = db.prepare(`SELECT id FROM feedback_forms WHERE qr_token = ? AND id != ?`).get(nextTok, row.id);
+      if (!dup) {
+        db.prepare(`UPDATE feedback_forms SET qr_token = ? WHERE id = ?`).run(nextTok, row.id);
+      }
+    }
+
+    const legacyReceiptRows = db
+      .prepare(`SELECT id, receipt_token FROM feedback_submissions WHERE receipt_token IS NULL OR receipt_token = '' OR receipt_token LIKE 'SNU-%'`)
+      .all() as Array<{ id: number; receipt_token: string | null }>;
     const updateReceiptToken = db.prepare(`UPDATE feedback_submissions SET receipt_token = ? WHERE id = ?`);
-    for (const row of missingTokenRows) {
-      const token = `SNU-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+    for (const row of legacyReceiptRows) {
+      const token =
+        row.receipt_token && row.receipt_token.startsWith('SNU-')
+          ? row.receipt_token.replace(/^SNU-/, 'SNPSU-')
+          : `SNPSU-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
       updateReceiptToken.run(token, row.id);
     }
 
@@ -679,21 +732,288 @@ function ensureSapthagiriCurriculumSynced(): void {
     ];
 
     for (const s of subjectSpecs) {
+      const deptId = getDeptId(s.deptCode);
+      const courseId = getCourseId(s.courseCode);
       const facId = facMap.get(s.empCode) ?? null;
-      const existingSub = db.prepare('SELECT id FROM subjects WHERE code = ?').get(s.code) as { id: number } | undefined;
-      if (existingSub) {
+      const existing = db.prepare('SELECT id FROM subjects WHERE code = ?').get(s.code) as { id: number } | undefined;
+      if (existing) {
         db.prepare(
-          `UPDATE subjects SET department_id = ?, course_id = ?, semester_id = ?, faculty_id = ?, short_code = ?, elective_group = ?, name = ?, credits = ? WHERE id = ?`
-        ).run(getDeptId(s.deptCode), getCourseId(s.courseCode), s.semId, facId, s.shortCode, s.electiveGroup, s.name, s.credits, existingSub.id);
+          `UPDATE subjects
+           SET department_id = ?, course_id = ?, semester_id = ?, faculty_id = ?, short_code = ?, elective_group = ?, name = ?, credits = ?, updated_at = datetime('now')
+           WHERE id = ?`
+        ).run(deptId, courseId, s.semId, facId, s.shortCode, s.electiveGroup, s.name, s.credits, existing.id);
       } else {
         db.prepare(
           `INSERT INTO subjects (department_id, course_id, semester_id, faculty_id, code, short_code, elective_group, name, credits)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(getDeptId(s.deptCode), getCourseId(s.courseCode), s.semId, facId, s.code, s.shortCode, s.electiveGroup, s.name, s.credits);
+        ).run(deptId, courseId, s.semId, facId, s.code, s.shortCode, s.electiveGroup, s.name, s.credits);
       }
     }
 
-    // 9. Ensure sample feedback submissions exist for 24SUUBECS001 and image subjects
+    // 8b. Ensure ALL 9 departments x ALL 8 semesters (Semester 1..8) have active curriculum subjects & assigned faculty
+    const allFacRows = db.prepare('SELECT id, employee_code, department_id FROM faculty').all() as Array<{
+      id: number;
+      employee_code: string;
+      department_id: number;
+    }>;
+    allFacRows.forEach((f) => {
+      if (!facMap.has(f.employee_code)) facMap.set(f.employee_code, f.id);
+    });
+
+    const semIdsByOrder: Record<number, number> = {
+      1: sem1Id,
+      2: sem2Id,
+      3: sem3Id,
+      4: sem4Id,
+      5: sem5Id,
+      6: sem6Id,
+      7: sem7Id,
+      8: sem8Id,
+    };
+
+    const deptCurriculumTemplates: Record<
+      string,
+      {
+        courseCode: string;
+        codePrefix: string;
+        empCodes: string[];
+        names: Record<number, [string, string, string]>;
+      }
+    > = {
+      CSE: {
+        courseCode: '24BECSE',
+        codePrefix: '24BECSE',
+        empCodes: ['FAC-101', 'FAC-105', 'FAC-201', 'FAC-202', 'FAC-204', 'FAC-206', 'FAC-209'],
+        names: {
+          1: ['Problem Solving with Python', 'PSP', 'Core'],
+          2: ['Data Structures & C Programming', 'DSC', 'Core'],
+          3: ['Object Oriented Programming with Java', 'OOPJ', 'Core'],
+          4: ['Design & Analysis of Algorithms', 'DAA', 'Core'],
+          5: ['Cloud Computing Technology', 'CCT', 'Core'],
+          6: ['Compiler Design & System Software', 'CDSS', 'Core'],
+          7: ['Distributed Cloud Systems & Security', 'DCSS', 'Core'],
+          8: ['Major Capstone Project & Viva', 'CAP', 'Project'],
+        },
+      },
+      ISE: {
+        courseCode: '24BEISE',
+        codePrefix: '24BEISE',
+        empCodes: ['FAC-208', 'FAC-105', 'FAC-201', 'FAC-207'],
+        names: {
+          1: ['Foundations of Information Systems', 'FIS', 'Core'],
+          2: ['Data Structures & Applications', 'DSA', 'Core'],
+          3: ['Operating Systems & Shell Scripting', 'OSS', 'Core'],
+          4: ['Database Engineering & SQL Labs', 'DES', 'Core'],
+          5: ['Software Testing & Quality Engineering', 'STQE', 'Core'],
+          6: ['Web Services & Full-Stack Architecture', 'WSFA', 'Core'],
+          7: ['Enterprise Information Security', 'EIS', 'Core'],
+          8: ['Industry Internship & Capstone', 'IIC', 'Project'],
+        },
+      },
+      AIML: {
+        courseCode: '24BEAIML',
+        codePrefix: '24BEAI',
+        empCodes: ['FAC-203', 'FAC-101', 'FAC-207', 'FAC-202'],
+        names: {
+          1: ['Mathematics for Machine Intelligence', 'MMI', 'Core'],
+          2: ['Python & Scientific Computing', 'PSC', 'Core'],
+          3: ['Foundations of Artificial Intelligence', 'FAI', 'Core'],
+          4: ['Statistical Pattern Recognition', 'SPR', 'Core'],
+          5: ['Deep Learning & Neural Networks', 'DLNN', 'Core'],
+          6: ['Natural Language Processing & LLMs', 'NLPL', 'Core'],
+          7: ['Computer Vision & Autonomous Systems', 'CVAS', 'Core'],
+          8: ['AI Research Capstone & Deployment', 'AIRC', 'Project'],
+        },
+      },
+      DS: {
+        courseCode: '24BEDS',
+        codePrefix: '24BEDS',
+        empCodes: ['FAC-207', 'FAC-202', 'FAC-203', 'FAC-104'],
+        names: {
+          1: ['Foundations of Data Analytics', 'FDA', 'Core'],
+          2: ['Discrete Structures & Linear Algebra', 'DSLA', 'Core'],
+          3: ['Data Wrangling & Exploratory Analysis', 'DWEA', 'Core'],
+          4: ['Probability & Data Science', 'PDS', 'Core'],
+          5: ['Big Data Mining & Visualization', 'BDMV', 'Core'],
+          6: ['Predictive Modeling & Time Series', 'PMTS', 'Core'],
+          7: ['Streaming Data Pipelines & MLOps', 'SDPM', 'Core'],
+          8: ['Data Science Capstone Project', 'DSCP', 'Project'],
+        },
+      },
+      ECE: {
+        courseCode: '24BEECE',
+        codePrefix: '24BEECE',
+        empCodes: ['FAC-102', 'FAC-201', 'FAC-103'],
+        names: {
+          1: ['Basic Electronics & Semiconductor Devices', 'BESD', 'Core'],
+          2: ['Network Analysis & Circuit Theory', 'NACT', 'Core'],
+          3: ['Analog & Digital Logic Design', 'ADLD', 'Core'],
+          4: ['Signals, Systems & Transforms', 'SST', 'Core'],
+          5: ['Embedded Microcontrollers & IoT', 'EMI', 'Core'],
+          6: ['VLSI Design & HDL Verification', 'VDHV', 'Core'],
+          7: ['Wireless Communication & RF Systems', 'WCRS', 'Core'],
+          8: ['Hardware Systems Capstone Project', 'HSCP', 'Project'],
+        },
+      },
+      EEE: {
+        courseCode: '24BEEEE',
+        codePrefix: '24BEEE',
+        empCodes: ['FAC-101', 'FAC-102', 'FAC-201'],
+        names: {
+          1: ['Elements of Electrical Engineering', 'EEE1', 'Core'],
+          2: ['DC Machines & Transformers', 'DCMT', 'Core'],
+          3: ['Analog Electronic Circuits', 'AEC', 'Core'],
+          4: ['Control Systems Engineering', 'CSE4', 'Core'],
+          5: ['Power Electronics & Drives', 'PED', 'Core'],
+          6: ['Power Systems & Smart Grids', 'PSG', 'Core'],
+          7: ['High Voltage & Renewable Energy', 'HVRE', 'Core'],
+          8: ['Electrical Engineering Capstone', 'EECP', 'Project'],
+        },
+      },
+      MECH: {
+        courseCode: '24BEMECH',
+        codePrefix: '24BEME',
+        empCodes: ['FAC-103', 'FAC-105', 'FAC-209'],
+        names: {
+          1: ['Engineering Graphics & CAD Fundamentals', 'EGC', 'Core'],
+          2: ['Engineering Mechanics & Statics', 'EMS', 'Core'],
+          3: ['Materials Science & Metallurgy', 'MSM', 'Core'],
+          4: ['Fluid Mechanics & Hydraulics', 'FMH', 'Core'],
+          5: ['Applied Thermodynamics & Heat Transfer', 'ATHT', 'Core'],
+          6: ['Finite Element Analysis & Design', 'FEAD', 'Core'],
+          7: ['Robotics, Mechatronics & Automation', 'RMA', 'Core'],
+          8: ['Mechanical Design Capstone Project', 'MDCP', 'Project'],
+        },
+      },
+      CIVIL: {
+        courseCode: '24BECIVIL',
+        codePrefix: '24BECV',
+        empCodes: ['FAC-105', 'FAC-202', 'FAC-103'],
+        names: {
+          1: ['Engineering Geology & Surveying', 'EGS', 'Core'],
+          2: ['Strength of Materials', 'SOM', 'Core'],
+          3: ['Building Materials & Construction Tech', 'BMCT', 'Core'],
+          4: ['Concrete Technology & Testing', 'CTT', 'Core'],
+          5: ['Design of RCC Structural Elements', 'DRSE', 'Core'],
+          6: ['Transportation & Highway Engineering', 'THE', 'Core'],
+          7: ['Structural Analysis & Geotech', 'SAG', 'Core'],
+          8: ['Infrastructure Design Capstone', 'IDCP', 'Project'],
+        },
+      },
+      MGMT: {
+        courseCode: '24MBATM',
+        codePrefix: '24MBTM',
+        empCodes: ['FAC-104', 'FAC-205', 'FAC-206'],
+        names: {
+          1: ['Managerial Economics & Accounting', 'MEA', 'Core'],
+          2: ['Organizational Behavior & Ethics', 'OBE', 'Core'],
+          3: ['Quantitative Business Methods', 'QBM', 'Core'],
+          4: ['Operations & Supply Chain Analytics', 'OSCA', 'Core'],
+          5: ['Enterprise Analytics & Digital Strategy', 'EADS', 'Core'],
+          6: ['Product Management & FinTech Systems', 'PMFS', 'Core'],
+          7: ['Global Corporate Governance', 'GCG', 'Core'],
+          8: ['Executive Management Thesis', 'EMT', 'Project'],
+        },
+      },
+    };
+
+    for (const [deptCode, tpl] of Object.entries(deptCurriculumTemplates)) {
+      const deptId = getDeptId(deptCode);
+      const courseId = getCourseId(tpl.courseCode);
+      for (let term = 1; term <= 8; term++) {
+        const semId = semIdsByOrder[term];
+        const countRow = db
+          .prepare(`SELECT COUNT(*) AS cnt FROM subjects WHERE department_id = ? AND semester_id = ?`)
+          .get(deptId, semId) as { cnt: number };
+        if (countRow.cnt === 0) {
+          const [subName, shortCode, group] = tpl.names[term];
+          const subCode = `${tpl.codePrefix}${term}01`;
+          const existsCode = db.prepare(`SELECT id FROM subjects WHERE code = ?`).get(subCode);
+          if (!existsCode) {
+            const empCode = tpl.empCodes[(term - 1) % tpl.empCodes.length];
+            const facId = facMap.get(empCode) ?? allFacRows[0]?.id ?? null;
+            db.prepare(
+              `INSERT INTO subjects (department_id, course_id, semester_id, faculty_id, code, short_code, elective_group, name, credits)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(deptId, courseId, semId, facId, subCode, shortCode, group, subName, term === 8 ? 8 : 4);
+          }
+        }
+      }
+    }
+
+    // 8c. Ensure every student has an assigned Proctor & create multi-dept/multi-semester students with 4-digit SRNs
+    const extraStudentSpecs: Array<{
+      email: string;
+      name: string;
+      deptCode: string;
+      courseCode: string;
+      term: number;
+      roll: string;
+      proctorEmp: string;
+      lang: string;
+    }> = [
+      { email: 'ishaan.verma@sapthagiri.edu', name: 'Ishaan Verma', deptCode: 'ISE', courseCode: '24BEISE', term: 5, roll: '24SUUBEIS0001', proctorEmp: 'FAC-208', lang: 'en' },
+      { email: 'kavya.hegde@sapthagiri.edu', name: 'Kavya Hegde', deptCode: 'AIML', courseCode: '24BEAIML', term: 5, roll: '24SUUBEAI0001', proctorEmp: 'FAC-203', lang: 'kn' },
+      { email: 'rohit.gowda@sapthagiri.edu', name: 'Rohit Gowda', deptCode: 'DS', courseCode: '24BEDS', term: 5, roll: '24SUUBEDS0001', proctorEmp: 'FAC-207', lang: 'kn' },
+      { email: 'divya.menon@sapthagiri.edu', name: 'Divya Menon', deptCode: 'EEE', courseCode: '24BEEEE', term: 6, roll: '24SUUBEEE0001', proctorEmp: 'FAC-101', lang: 'en' },
+      { email: 'sanjay.patil@sapthagiri.edu', name: 'Sanjay Patil', deptCode: 'CIVIL', courseCode: '24BECIVIL', term: 7, roll: '24SUUBECV0001', proctorEmp: 'FAC-105', lang: 'kn' },
+      { email: 'meghana.bhat@sapthagiri.edu', name: 'Meghana Bhat', deptCode: 'CSE', courseCode: '24BECSE', term: 1, roll: '24SUUBECS0003', proctorEmp: 'FAC-101', lang: 'en' },
+      { email: 'aditya.joshi@sapthagiri.edu', name: 'Aditya Joshi', deptCode: 'CSE', courseCode: '24BECSE', term: 2, roll: '24SUUBECS0004', proctorEmp: 'FAC-101', lang: 'hi' },
+      { email: 'tanvi.kulkarni@sapthagiri.edu', name: 'Tanvi Kulkarni', deptCode: 'CSE', courseCode: '24BECSE', term: 3, roll: '24SUUBECS0005', proctorEmp: 'FAC-201', lang: 'kn' },
+      { email: 'nikhil.reddy@sapthagiri.edu', name: 'Nikhil Reddy', deptCode: 'CSE', courseCode: '24BECSE', term: 4, roll: '24SUUBECS0006', proctorEmp: 'FAC-202', lang: 'te' },
+      { email: 'sneha.iyer@sapthagiri.edu', name: 'Sneha Iyer', deptCode: 'CSE', courseCode: '24BECSE', term: 6, roll: '24SUUBECS0007', proctorEmp: 'FAC-209', lang: 'en' },
+      { email: 'varun.shetty@sapthagiri.edu', name: 'Varun Shetty', deptCode: 'CSE', courseCode: '24BECSE', term: 8, roll: '24SUUBECS0008', proctorEmp: 'FAC-101', lang: 'kn' },
+    ];
+
+    const semAyLookup: Record<number, { semId: number; ayId: number }> = {
+      1: { semId: sem1Id, ayId: yr2024 },
+      2: { semId: sem2Id, ayId: yr2024 },
+      3: { semId: sem3Id, ayId: yr2025 },
+      4: { semId: sem4Id, ayId: yr2025 },
+      5: { semId: sem5Id, ayId: yr2026 },
+      6: { semId: sem6Id, ayId: yr2026 },
+      7: { semId: sem7Id, ayId: yr2027 },
+      8: { semId: sem8Id, ayId: yr2027 },
+    };
+
+    for (const st of extraStudentSpecs) {
+      const existingRoll = db.prepare(`SELECT id FROM students WHERE roll_number = ?`).get(st.roll);
+      if (existingRoll) continue;
+      let uRow = db.prepare(`SELECT id FROM users WHERE email = ?`).get(st.email) as { id: number } | undefined;
+      if (!uRow) {
+        const res = db
+          .prepare(`INSERT INTO users (email, password_hash, full_name, role, preferred_language) VALUES (?, ?, ?, 'student', ?)`)
+          .run(st.email, demoPass, st.name, st.lang);
+        uRow = { id: Number(res.lastInsertRowid) };
+      }
+      const existingStuByUser = db.prepare(`SELECT id FROM students WHERE user_id = ?`).get(uRow.id);
+      if (!existingStuByUser) {
+        const sa = semAyLookup[st.term] || semAyLookup[5];
+        const proctorId = facMap.get(st.proctorEmp) ?? facMap.get('FAC-101') ?? null;
+        db.prepare(
+          `INSERT INTO students (user_id, department_id, course_id, academic_year_id, semester_id, proctor_faculty_id, roll_number, batch_year)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 2024)`
+        ).run(uRow.id, getDeptId(st.deptCode), getCourseId(st.courseCode), sa.ayId, sa.semId, proctorId, st.roll);
+      }
+    }
+
+    // Backfill proctor_faculty_id for any student where it is NULL
+    const studentsWithoutProctor = db
+      .prepare(`SELECT id, department_id, roll_number FROM students WHERE proctor_faculty_id IS NULL`)
+      .all() as Array<{ id: number; department_id: number; roll_number: string }>;
+    const defaultProctorId = facMap.get('FAC-101') ?? allFacRows[0]?.id ?? null;
+    for (const stu of studentsWithoutProctor) {
+      const deptFac = allFacRows.find((f) => f.department_id === stu.department_id);
+      const assignedProctor =
+        stu.roll_number === '24SUUBECS0001' || stu.roll_number === '24SUUBECS0002' || stu.roll_number === '24SUUBECS0019'
+          ? defaultProctorId
+          : deptFac?.id ?? defaultProctorId;
+      if (assignedProctor) {
+        db.prepare(`UPDATE students SET proctor_faculty_id = ? WHERE id = ?`).run(assignedProctor, stu.id);
+      }
+    }
+
+    // 9. Ensure sample feedback submissions exist for 24SUUBECS0001 and image subjects
     const primaryForm = db
       .prepare(`SELECT id FROM feedback_forms WHERE is_active = 1 ORDER BY id ASC LIMIT 1`)
       .get() as { id: number } | undefined;
@@ -701,10 +1021,10 @@ function ensureSapthagiriCurriculumSynced(): void {
       .prepare(`SELECT id FROM feedback_forms WHERE is_active = 1 ORDER BY id DESC LIMIT 1`)
       .get() as { id: number } | undefined;
     const primaryStudent = db
-      .prepare(`SELECT id FROM students WHERE roll_number = '24SUUBECS001' LIMIT 1`)
+      .prepare(`SELECT id FROM students WHERE roll_number = '24SUUBECS0001' LIMIT 1`)
       .get() as { id: number } | undefined;
     const peerStudent = db
-      .prepare(`SELECT id FROM students WHERE roll_number = '24SUUBECS002' LIMIT 1`)
+      .prepare(`SELECT id FROM students WHERE roll_number = '24SUUBECS0002' LIMIT 1`)
       .get() as { id: number } | undefined;
 
     if (primaryForm && primaryStudent) {
@@ -739,6 +1059,30 @@ function ensureSapthagiriCurriculumSynced(): void {
           anon: 1,
           comment: 'Preetheshnaatha S R connects gradient descent and SVM math clearly to Python notebooks.',
           ratings: [4.7, 4.6, 4.8, 4.9, 4.6, 4.3, 4.1, 4.7],
+        },
+        {
+          formId: primaryForm.id,
+          stuId: peerStudent?.id ?? primaryStudent.id,
+          subCode: '24BECSE504',
+          anon: 0,
+          comment: 'Deepashree H L explains DFA minimization, Turing machines, and pumping lemma proofs with great clarity.',
+          ratings: [4.6, 4.7, 4.8, 4.8, 4.6, 4.4, 4.1, 4.6],
+        },
+        {
+          formId: primaryForm.id,
+          stuId: peerStudent?.id ?? primaryStudent.id,
+          subCode: '24BECSE505',
+          anon: 1,
+          comment: 'Bhavya A uses live analytics and SEO campaign case studies that make Digital Marketing practical.',
+          ratings: [4.5, 4.8, 4.7, 4.6, 4.7, 4.5, 4.2, 4.6],
+        },
+        {
+          formId: primaryForm.id,
+          stuId: peerStudent?.id ?? primaryStudent.id,
+          subCode: '24BECSE506',
+          anon: 0,
+          comment: 'Nikitha K facilitates interactive engineering ethics case discussions and workplace integrity scenarios.',
+          ratings: [4.7, 4.9, 4.8, 4.7, 4.6, 4.6, 4.3, 4.7],
         },
         {
           formId: secondaryForm?.id ?? primaryForm.id,
@@ -777,7 +1121,7 @@ function ensureSapthagiriCurriculumSynced(): void {
           .get(item.formId, item.stuId, subRow.id);
         if (dup) continue;
 
-        const receiptToken = `SNU-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+        const receiptToken = `SNPSU-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
         const subRes = db
           .prepare(
             `INSERT INTO feedback_submissions (form_id, student_id, subject_id, faculty_id, status, is_anonymous, comment_text, receipt_token)
@@ -789,6 +1133,129 @@ function ensureSapthagiriCurriculumSynced(): void {
           `INSERT INTO feedback_ratings (submission_id, teaching_quality, communication, punctuality, subject_knowledge, methodology, classroom_environment, infrastructure, overall_satisfaction)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(subId, ...item.ratings);
+      }
+    }
+
+    // 10. Backfill poll responses (feedback_responses) for any submitted evaluation missing poll answers
+    const submissionsWithoutResponses = db
+      .prepare(
+        `SELECT fs.id AS submission_id, fs.form_id, fs.comment_text, r.teaching_quality, r.communication, r.infrastructure, r.overall_satisfaction
+         FROM feedback_submissions fs
+         JOIN feedback_ratings r ON r.submission_id = fs.id
+         WHERE fs.status = 'submitted'
+           AND NOT EXISTS (SELECT 1 FROM feedback_responses fr WHERE fr.submission_id = fs.id)`
+      )
+      .all() as Array<{
+      submission_id: number;
+      form_id: number;
+      comment_text: string;
+      teaching_quality: number;
+      communication: number;
+      infrastructure: number;
+      overall_satisfaction: number;
+    }>;
+
+    const getFormQuestions = db.prepare(
+      `SELECT id, question_type, options_json FROM feedback_questions WHERE form_id = ? ORDER BY sort_order ASC`
+    );
+    const insResp = db.prepare(
+      `INSERT OR IGNORE INTO feedback_responses (submission_id, question_id, response_value, numeric_score) VALUES (?, ?, ?, ?)`
+    );
+
+    for (const sub of submissionsWithoutResponses) {
+      const qs = getFormQuestions.all(sub.form_id) as Array<{
+        id: number;
+        question_type: string;
+        options_json: string | null;
+      }>;
+      for (const q of qs) {
+        if (q.question_type === 'star') {
+          insResp.run(sub.submission_id, q.id, String(sub.teaching_quality), sub.teaching_quality);
+        } else if (q.question_type === 'slider') {
+          insResp.run(sub.submission_id, q.id, String(sub.infrastructure), sub.infrastructure);
+        } else if (q.question_type === 'radio') {
+          let chosen = 'Always timely & clear';
+          if (q.options_json) {
+            try {
+              const opts = JSON.parse(q.options_json) as string[];
+              if (opts.length > 0) {
+                if (sub.overall_satisfaction >= 4.5) chosen = opts[0];
+                else if (sub.overall_satisfaction >= 3.7 && opts[1]) chosen = opts[1];
+                else if (sub.overall_satisfaction >= 3.0 && opts[2]) chosen = opts[2];
+                else chosen = opts[opts.length - 1];
+              }
+            } catch {
+              // ignore
+            }
+          }
+          insResp.run(sub.submission_id, q.id, chosen, null);
+        } else {
+          insResp.run(sub.submission_id, q.id, sub.comment_text || 'Constructive feedback recorded.', null);
+        }
+      }
+    }
+
+    // 11. Sync feedback_requests for all existing submissions AND seed pending online requests per student/department/faculty
+    db.prepare(
+      `INSERT INTO feedback_requests (form_id, student_id, subject_id, faculty_id, proctor_faculty_id, status, request_note, requested_at, completed_at)
+       SELECT fs.form_id, fs.student_id, fs.subject_id, COALESCE(fs.faculty_id, sub.faculty_id), stu.proctor_faculty_id,
+              CASE WHEN fs.status = 'submitted' THEN 'completed' ELSE 'in_progress' END,
+              'Online course evaluation request',
+              fs.created_at,
+              CASE WHEN fs.status = 'submitted' THEN fs.submitted_at ELSE NULL END
+       FROM feedback_submissions fs
+       JOIN students stu ON stu.id = fs.student_id
+       JOIN subjects sub ON sub.id = fs.subject_id
+       WHERE NOT EXISTS (
+         SELECT 1 FROM feedback_requests fr
+         WHERE fr.form_id = fs.form_id AND fr.student_id = fs.student_id AND fr.subject_id = fs.subject_id
+       )`
+    ).run();
+
+    // Also update any existing feedback_requests whose status changed via submission
+    db.prepare(
+      `UPDATE feedback_requests
+       SET status = 'completed',
+           completed_at = COALESCE(completed_at, datetime('now')),
+           updated_at = datetime('now')
+       WHERE status != 'completed'
+         AND EXISTS (
+           SELECT 1 FROM feedback_submissions fs
+           WHERE fs.form_id = feedback_requests.form_id
+             AND fs.student_id = feedback_requests.student_id
+             AND fs.subject_id = feedback_requests.subject_id
+             AND fs.status = 'submitted'
+         )`
+    ).run();
+
+    // Ensure every student has online requests for their enrolled department & semester subjects (and Sem 5 active campaigns)
+    const targetFormId = primaryForm?.id ?? secondaryForm?.id;
+    if (targetFormId) {
+      const stuRows = db
+        .prepare(`SELECT id, department_id, semester_id, proctor_faculty_id FROM students`)
+        .all() as Array<{ id: number; department_id: number; semester_id: number; proctor_faculty_id: number | null }>;
+      const insReq = db.prepare(
+        `INSERT OR IGNORE INTO feedback_requests (form_id, student_id, subject_id, faculty_id, proctor_faculty_id, status, request_note)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?)`
+      );
+      for (const stu of stuRows) {
+        const matchingSubjects = db
+          .prepare(
+            `SELECT id, faculty_id FROM subjects
+             WHERE department_id = ? AND semester_id = ?
+             ORDER BY id ASC LIMIT 6`
+          )
+          .all(stu.department_id, stu.semester_id) as Array<{ id: number; faculty_id: number | null }>;
+        for (const sub of matchingSubjects) {
+          insReq.run(
+            targetFormId,
+            stu.id,
+            sub.id,
+            sub.faculty_id,
+            stu.proctor_faculty_id,
+            'Semester online feedback request assigned by department faculty & proctor.'
+          );
+        }
       }
     }
   });
@@ -911,14 +1378,14 @@ export function seedDatabase(): void {
       Number(insertFaculty.run(facUserIds[4], deptIds[0], 'FAC-105', 'Assistant Professor', 'Database Systems & Cloud').lastInsertRowid),
     ];
 
-    // Student rows (24SUUBECS001 format)
+    // Student rows (4-digit 24SUUBECS0001 format)
     const studentIds = [
-      Number(insertStudent.run(stuUserIds[0], deptIds[0], courseIds[0], yr2026, sem3, '24SUUBECS001', 2024).lastInsertRowid),
-      Number(insertStudent.run(stuUserIds[1], deptIds[0], courseIds[0], yr2026, sem3, '24SUUBECS002', 2024).lastInsertRowid),
-      Number(insertStudent.run(stuUserIds[2], deptIds[1], courseIds[1], yr2026, sem3, '24SUUBEEC014', 2024).lastInsertRowid),
-      Number(insertStudent.run(stuUserIds[3], deptIds[2], courseIds[2], yr2026, sem3, '24SUUBEME008', 2024).lastInsertRowid),
-      Number(insertStudent.run(stuUserIds[4], deptIds[3], courseIds[3], yr2026, sem3, '24SUUMBTM011', 2024).lastInsertRowid),
-      Number(insertStudent.run(stuUserIds[5], deptIds[0], courseIds[0], yr2026, sem3, '24SUUBECS019', 2024).lastInsertRowid),
+      Number(insertStudent.run(stuUserIds[0], deptIds[0], courseIds[0], yr2026, sem3, '24SUUBECS0001', 2024).lastInsertRowid),
+      Number(insertStudent.run(stuUserIds[1], deptIds[0], courseIds[0], yr2026, sem3, '24SUUBECS0002', 2024).lastInsertRowid),
+      Number(insertStudent.run(stuUserIds[2], deptIds[1], courseIds[1], yr2026, sem3, '24SUUBEEC0014', 2024).lastInsertRowid),
+      Number(insertStudent.run(stuUserIds[3], deptIds[2], courseIds[2], yr2026, sem3, '24SUUBEME0008', 2024).lastInsertRowid),
+      Number(insertStudent.run(stuUserIds[4], deptIds[3], courseIds[3], yr2026, sem3, '24SUUMBTM0011', 2024).lastInsertRowid),
+      Number(insertStudent.run(stuUserIds[5], deptIds[0], courseIds[0], yr2026, sem3, '24SUUBECS0019', 2024).lastInsertRowid),
     ];
 
     // Core legacy subjects across semesters
@@ -936,7 +1403,7 @@ export function seedDatabase(): void {
     const formFallCSE = Number(
       insertForm.run(
         'Semester 5 CSE Core & Elective Course Evaluation',
-        'Structured evaluation of faculty instruction, cloud and data engineering labs, and Semester 5 elective courses at Sapthagiri NPS University.',
+        'Structured evaluation of faculty instruction, cloud and data engineering labs, and Semester 5 elective courses at Sapthagiri NPS University (SNPSU).',
         deptIds[0],
         courseIds[0],
         null,
@@ -946,15 +1413,15 @@ export function seedDatabase(): void {
         '2026-12-20',
         1,
         1,
-        'SNU-SEM5-CSE',
+        'SNPSU-SEM5-CSE',
         adminId
       ).lastInsertRowid
     );
 
     const formFallAll = Number(
       insertForm.run(
-        'Sapthagiri Campus Facilities & Academic Experience Survey',
-        'University-wide student survey covering smart classrooms, laboratory equipment, library infrastructure, examination clarity, and support services.',
+        'SNPSU Campus Facilities & Academic Experience Survey',
+        'Sapthagiri NPS University (SNPSU) student survey covering smart classrooms, laboratory equipment, library infrastructure, examination clarity, and support services.',
         null,
         null,
         null,
@@ -964,7 +1431,7 @@ export function seedDatabase(): void {
         '2026-12-28',
         1,
         1,
-        'SNU-SEM5-CAMPUS',
+        'SNPSU-SEM5-CAMPUS',
         adminId
       ).lastInsertRowid
     );
@@ -1161,7 +1628,7 @@ export function seedDatabase(): void {
     ];
 
     for (const s of sampleSubmissions) {
-      const receiptToken = `SNU-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+      const receiptToken = `SNPSU-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
       const subId = Number(
         insertSubmission.run(s.formId, s.studentId, s.subjectId, s.facultyId, 'submitted', s.anon, s.comment, receiptToken, s.date).lastInsertRowid
       );

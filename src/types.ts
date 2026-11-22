@@ -164,6 +164,9 @@ export interface StudentProfileRecord {
   course_id: number;
   academic_year_id: number;
   semester_id: number;
+  proctor_faculty_id?: number | null;
+  proctor_name?: string | null;
+  proctor_employee_code?: string | null;
   roll_number: string;
   batch_year: number;
   email: string;
@@ -204,6 +207,71 @@ export interface DepartmentSemesterRow {
 export interface DepartmentSemesterTrackingResponse {
   semesters: Semester[];
   departments: DepartmentSemesterRow[];
+}
+
+export interface SubjectPollOption {
+  label: string;
+  count: number;
+  percentage: number;
+}
+
+export interface SubjectPollItem {
+  question_id: number;
+  form_id: number;
+  form_title: string;
+  question_text: string;
+  question_type: 'star' | 'slider' | 'radio' | 'text';
+  category: string;
+  total_votes: number;
+  avg_score: number | null;
+  options: SubjectPollOption[];
+}
+
+export interface ProctorMenteeRecord {
+  student_id: number;
+  user_id: number;
+  roll_number: string;
+  full_name: string;
+  email: string;
+  department_code: string;
+  department_name: string;
+  course_code: string;
+  semester_name: string;
+  term_order: number;
+  requests_given: number;
+  feedbacks_completed: number;
+  feedbacks_pending: number;
+  in_progress_count: number;
+  last_activity_at: string | null;
+}
+
+export interface ProctorSubjectAnalysisRow {
+  subject_id: number;
+  subject_code: string;
+  short_code?: string | null;
+  subject_name: string;
+  semester_name: string;
+  instructor_name: string | null;
+  requests_count: number;
+  reviews_count: number;
+  avg_teaching: number | null;
+  avg_communication: number | null;
+  avg_infrastructure: number | null;
+  avg_overall: number | null;
+}
+
+export interface FacultyRequestAnalyticsRow {
+  faculty_id: number;
+  faculty_name: string;
+  employee_code: string;
+  dept_code: string;
+  assigned_subjects: number;
+  total_requests: number;
+  completed_feedbacks: number;
+  in_progress_requests: number;
+  pending_requests: number;
+  response_rate_pct: number;
+  avg_overall: number | null;
 }
 
 export interface VerifiedReceiptData {

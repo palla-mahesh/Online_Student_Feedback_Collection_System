@@ -91,15 +91,17 @@ CREATE TABLE students (
   course_id BIGINT NOT NULL,
   academic_year_id BIGINT NOT NULL,
   semester_id BIGINT NOT NULL,
+  proctor_faculty_id BIGINT NULL,
   roll_number VARCHAR(50) NOT NULL UNIQUE,
-  batch_year INT NOT NULL DEFAULT 2026,
+  batch_year INT NOT NULL DEFAULT 2024,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   CONSTRAINT fk_stu_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
   CONSTRAINT fk_stu_dept FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE RESTRICT,
   CONSTRAINT fk_stu_course FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE RESTRICT,
   CONSTRAINT fk_stu_year FOREIGN KEY (academic_year_id) REFERENCES academic_years(id) ON DELETE RESTRICT,
-  CONSTRAINT fk_stu_sem FOREIGN KEY (semester_id) REFERENCES semesters(id) ON DELETE RESTRICT
+  CONSTRAINT fk_stu_sem FOREIGN KEY (semester_id) REFERENCES semesters(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_stu_proctor FOREIGN KEY (proctor_faculty_id) REFERENCES faculty(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE subjects (
@@ -178,6 +180,26 @@ CREATE TABLE feedback_submissions (
   CONSTRAINT fk_subm_stu FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
   CONSTRAINT fk_subm_sub FOREIGN KEY (subject_id) REFERENCES subjects(id) ON DELETE CASCADE,
   CONSTRAINT fk_subm_fac FOREIGN KEY (faculty_id) REFERENCES faculty(id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE feedback_requests (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  form_id BIGINT NOT NULL,
+  student_id BIGINT NOT NULL,
+  subject_id BIGINT NOT NULL,
+  faculty_id BIGINT NULL,
+  proctor_faculty_id BIGINT NULL,
+  status ENUM('pending', 'in_progress', 'completed') NOT NULL DEFAULT 'pending',
+  request_note TEXT NOT NULL,
+  requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  completed_at DATETIME NULL,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_fb_req (form_id, student_id, subject_id),
+  CONSTRAINT fk_req_form FOREIGN KEY (form_id) REFERENCES feedback_forms(id) ON DELETE CASCADE,
+  CONSTRAINT fk_req_stu FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+  CONSTRAINT fk_req_sub FOREIGN KEY (subject_id) REFERENCES subjects(id) ON DELETE CASCADE,
+  CONSTRAINT fk_req_fac FOREIGN KEY (faculty_id) REFERENCES faculty(id) ON DELETE SET NULL,
+  CONSTRAINT fk_req_proc FOREIGN KEY (proctor_faculty_id) REFERENCES faculty(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE feedback_ratings (
@@ -322,8 +344,8 @@ INSERT INTO courses (department_id, code, name, degree_level, duration_years) VA
 (9, '24MBATM', 'MBA Technology Management', 'Postgraduate', 2);
 
 INSERT INTO feedback_forms (title, description, department_id, course_id, academic_year_id, semester_id, open_date, close_date, is_active, allow_anonymous, qr_token) VALUES
-('Semester 5 CSE Core & Elective Course Evaluation', 'Structured evaluation of faculty instruction, cloud and data engineering labs, and Semester 5 elective courses.', 1, 1, 3, 5, '2026-10-01', '2026-12-20', 1, 1, 'SNU-SEM5-CSE'),
-('Sapthagiri Campus Facilities & Academic Experience Survey', 'University-wide student survey covering smart classrooms, laboratory equipment, library infrastructure, and student support.', NULL, NULL, 3, 5, '2026-10-15', '2026-12-28', 1, 1, 'SNU-SEM5-CAMPUS');
+('Semester 5 CSE Core & Elective Course Evaluation', 'Structured evaluation of faculty instruction, cloud and data engineering labs, and Semester 5 elective courses.', 1, 1, 3, 5, '2026-10-01', '2026-12-20', 1, 1, 'SNPSU-SEM5-CSE'),
+('Sapthagiri Campus Facilities & Academic Experience Survey', 'University-wide student survey covering smart classrooms, laboratory equipment, library infrastructure, and student support.', NULL, NULL, 3, 5, '2026-10-15', '2026-12-28', 1, 1, 'SNPSU-SEM5-CAMPUS');
 `;
 
   const configPy = `import os
@@ -529,7 +551,7 @@ def submit_feedback():
     subject_id = data.get("subject_id")
     comment_text = (data.get("comment_text") or "").strip()
     is_anonymous = 1 if data.get("is_anonymous") else 0
-    receipt_token = "SNU-" + secrets.token_hex(6).upper()
+    receipt_token = "SNPSU-" + secrets.token_hex(6).upper()
 
     db.session.execute(
         text("""
@@ -550,7 +572,7 @@ def submit_feedback():
 def verify_receipt():
     raw_receipt = (request.args.get("receipt") or "").strip()
     token = (request.args.get("token") or "").strip()
-    match = re.match(r"^(?:SNU-REC-)?0*(\\d+)$", raw_receipt, re.IGNORECASE)
+    match = re.match(r"^(?:SNPSU-REC-|SNU-REC-)?0*(\\d+)$", raw_receipt, re.IGNORECASE)
     if not match or not token:
         return jsonify({"error": "Valid receipt and token query parameters are required"}), 400
 
@@ -579,7 +601,7 @@ def verify_receipt():
     is_anon = int(row["is_anonymous"]) == 1
     return jsonify({
         "receipt": {
-            "receiptNumber": f"SNU-REC-{sub_id:05d}",
+            "receiptNumber": f"SNPSU-REC-{sub_id:05d}",
             "status": row["status"],
             "is_anonymous": is_anon,
             "student_name": "Anonymous Respondent" if is_anon else row["student_name"],

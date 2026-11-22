@@ -24,8 +24,10 @@ const authLimiter = createRateLimiter(25, 60 * 1000);
 const aiLimiter = createRateLimiter(20, 60 * 1000);
 
 const QR_TOKEN_ALIASES: Record<string, string> = {
-  'MSU-FALL26-CSE': 'SNU-SEM5-CSE',
-  'MSU-FALL26-ALL': 'SNU-SEM5-CAMPUS',
+  'MSU-FALL26-CSE': 'SNPSU-SEM5-CSE',
+  'SNU-SEM5-CSE': 'SNPSU-SEM5-CSE',
+  'MSU-FALL26-ALL': 'SNPSU-SEM5-CAMPUS',
+  'SNU-SEM5-CAMPUS': 'SNPSU-SEM5-CAMPUS',
 };
 
 function resolvePublicOrigin(req: Request): string {
@@ -62,14 +64,16 @@ function resolvePublicOrigin(req: Request): string {
 
 function ensureSubmissionReceiptToken(submissionId: number, currentToken: unknown): string {
   if (typeof currentToken === 'string' && currentToken.trim().length >= 8) {
-    return currentToken.trim();
+    return currentToken.trim().startsWith('SNU-')
+      ? currentToken.trim().replace(/^SNU-/, 'SNPSU-')
+      : currentToken.trim();
   }
-  const nextToken = `SNU-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+  const nextToken = `SNPSU-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
   db.prepare(`UPDATE feedback_submissions SET receipt_token = ? WHERE id = ?`).run(nextToken, submissionId);
   return nextToken;
 }
 
-const ENROLLMENT_FORMAT_REGEX = /^\d{2}SUU[A-Z]{2,6}\d{3}$/;
+const ENROLLMENT_FORMAT_REGEX = /^\d{2}SUU[A-Z]{2,6}\d{4}$/;
 const DEPT_PROGRAM_INFIX: Record<string, string> = {
   CSE: 'BECS',
   ISE: 'BEIS',
@@ -96,13 +100,60 @@ function generateEnrollmentNumber(deptCode: string, batchYear: number): string {
     .prepare(`SELECT roll_number FROM students WHERE roll_number LIKE ?`)
     .all(`${prefix}%`) as Array<{ roll_number: string }>;
   const used = new Set(existingRows.map((r) => r.roll_number));
-  for (let seq = 1; seq <= 999; seq++) {
-    const candidate = `${prefix}${String(seq).padStart(3, '0')}`;
+  for (let seq = 1; seq <= 9999; seq++) {
+    const candidate = `${prefix}${String(seq).padStart(4, '0')}`;
     if (!used.has(candidate)) {
       return candidate;
     }
   }
-  return `${prefix}${String(Date.now()).slice(-3)}`;
+  return `${prefix}${String(Date.now()).slice(-4)}`;
+}
+
+function resolveDefaultProctorForDepartment(departmentId: number, requestedProctorId?: number): number | null {
+  if (requestedProctorId && requestedProctorId > 0) {
+    const found = db.prepare(`SELECT id FROM faculty WHERE id = ?`).get(requestedProctorId) as { id: number } | undefined;
+    if (found) return found.id;
+  }
+  const deptFac = db
+    .prepare(`SELECT id FROM faculty WHERE department_id = ? ORDER BY id ASC LIMIT 1`)
+    .get(departmentId) as { id: number } | undefined;
+  if (deptFac) return deptFac.id;
+  const anyFac = db.prepare(`SELECT id FROM faculty ORDER BY id ASC LIMIT 1`).get() as { id: number } | undefined;
+  return anyFac?.id ?? null;
+}
+
+function seedInitialFeedbackRequestsForStudent(
+  studentId: number,
+  departmentId: number,
+  semesterId: number,
+  proctorFacultyId: number | null
+) {
+  const activeForm = db
+    .prepare(`SELECT id FROM feedback_forms WHERE is_active = 1 ORDER BY id ASC LIMIT 1`)
+    .get() as { id: number } | undefined;
+  if (!activeForm) return;
+  const subjects = db
+    .prepare(
+      `SELECT id, faculty_id FROM subjects
+       WHERE department_id = ? AND semester_id = ?
+       ORDER BY id ASC LIMIT 6`
+    )
+    .all(departmentId, semesterId) as Array<{ id: number; faculty_id: number | null }>;
+
+  const ins = db.prepare(
+    `INSERT OR IGNORE INTO feedback_requests (form_id, student_id, subject_id, faculty_id, proctor_faculty_id, status, request_note)
+     VALUES (?, ?, ?, ?, ?, 'pending', ?)`
+  );
+  for (const sub of subjects) {
+    ins.run(
+      activeForm.id,
+      studentId,
+      sub.id,
+      sub.faculty_id,
+      proctorFacultyId,
+      'Online course feedback request assigned for enrolled semester.'
+    );
+  }
 }
 
 function buildStudentEightSemesterTracking(
@@ -465,7 +516,7 @@ apiRouter.post('/auth/register', authLimiter, (req, res) => {
   if (cleanRoll && !ENROLLMENT_FORMAT_REGEX.test(cleanRoll)) {
     res.status(400).json({
       error:
-        'Enrollment number must match the 24SUUBECS001 format (2-digit year + SUU + program code + 3-digit roll, e.g. 24SUUBECS104).',
+        'Enrollment number (SRN) must match the 24SUUBECS0001 format (2-digit year + SUU + program code + 4-digit sequence, e.g. 24SUUBECS0001).',
     });
     return;
   }
@@ -522,6 +573,7 @@ apiRouter.post('/auth/register', authLimiter, (req, res) => {
   }
 
   const pwHash = hashPassword(cleanPass);
+  const proctorId = resolveDefaultProctorForDepartment(deptRow.id, Number(req.body?.proctor_faculty_id));
 
   const tx = db.transaction(() => {
     const uRes = db
@@ -531,10 +583,15 @@ apiRouter.post('/auth/register', authLimiter, (req, res) => {
       .run(cleanEmail, pwHash, cleanName, lang);
     const userId = Number(uRes.lastInsertRowid);
 
-    db.prepare(
-      `INSERT INTO students (user_id, department_id, course_id, academic_year_id, semester_id, roll_number, batch_year)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(userId, deptRow.id, courseRow.id, semRow.academic_year_id, semRow.id, generatedRoll, parsedBatch);
+    const stuRes = db
+      .prepare(
+        `INSERT INTO students (user_id, department_id, course_id, academic_year_id, semester_id, proctor_faculty_id, roll_number, batch_year)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(userId, deptRow.id, courseRow.id, semRow.academic_year_id, semRow.id, proctorId, generatedRoll, parsedBatch);
+    const studentId = Number(stuRes.lastInsertRowid);
+
+    seedInitialFeedbackRequestsForStudent(studentId, deptRow.id, semRow.id, proctorId);
 
     return userId;
   });
@@ -547,7 +604,7 @@ apiRouter.post('/auth/register', authLimiter, (req, res) => {
     action: 'STUDENT_REGISTERED',
     entityType: 'users',
     entityId: userId,
-    details: { roll_number: generatedRoll, semester_id: semRow.id, department_id: deptRow.id },
+    details: { roll_number: generatedRoll, semester_id: semRow.id, department_id: deptRow.id, proctor_faculty_id: proctorId },
     ipAddress: req.ip,
   });
 
@@ -560,6 +617,7 @@ apiRouter.post('/auth/register', authLimiter, (req, res) => {
       department_id: deptRow.id,
       course_id: courseRow.id,
       semester_id: semRow.id,
+      proctor_faculty_id: proctorId,
       batch_year: parsedBatch,
     },
   });
@@ -770,24 +828,45 @@ apiRouter.put('/auth/profile', requireAuth, (req: AuthenticatedRequest, res) => 
 // ---------------------------------------------------------------------------
 // STUDENT ENDPOINTS
 // ---------------------------------------------------------------------------
-apiRouter.get('/students', requireAuth, requireRole('admin'), (req, res) => {
+apiRouter.get('/students', requireAuth, requireRole('admin', 'faculty'), (req, res) => {
   const search = typeof req.query.search === 'string' ? `%${req.query.search.trim()}%` : '%';
+  const proctorFacultyId = Number(req.query.proctorFacultyId) || 0;
+  const departmentId = Number(req.query.departmentId) || 0;
+
+  const whereClauses: string[] = ['(u.full_name LIKE ? OR u.email LIKE ? OR s.roll_number LIKE ?)'];
+  const params: unknown[] = [search, search, search];
+
+  if (proctorFacultyId > 0) {
+    whereClauses.push('s.proctor_faculty_id = ?');
+    params.push(proctorFacultyId);
+  }
+  if (departmentId > 0) {
+    whereClauses.push('s.department_id = ?');
+    params.push(departmentId);
+  }
+
   const rows = db
     .prepare(
       `SELECT s.id, u.id AS user_id, u.full_name, u.email, u.is_active, s.roll_number, s.batch_year,
-              s.department_id, s.course_id, s.semester_id,
+              s.department_id, s.course_id, s.semester_id, s.proctor_faculty_id,
               d.code AS department_code, d.name AS department_name, c.code AS course_code, c.name AS course_name,
               sem.name AS semester_name, sem.term_order,
-              (SELECT COUNT(*) FROM feedback_submissions fs WHERE fs.student_id = s.id AND fs.status = 'submitted') AS submissions_count
+              pu.full_name AS proctor_name, pf.employee_code AS proctor_employee_code,
+              (SELECT COUNT(*) FROM feedback_submissions fs WHERE fs.student_id = s.id AND fs.status = 'submitted') AS submissions_count,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.student_id = s.id) AS requests_count,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.student_id = s.id AND fr.status = 'completed') AS completed_requests_count,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.student_id = s.id AND fr.status != 'completed') AS pending_requests_count
        FROM students s
        JOIN users u ON u.id = s.user_id
        JOIN departments d ON d.id = s.department_id
        JOIN courses c ON c.id = s.course_id
        JOIN semesters sem ON sem.id = s.semester_id
-       WHERE u.full_name LIKE ? OR u.email LIKE ? OR s.roll_number LIKE ?
-       ORDER BY s.id DESC`
+       LEFT JOIN faculty pf ON pf.id = s.proctor_faculty_id
+       LEFT JOIN users pu ON pu.id = pf.user_id
+       WHERE ${whereClauses.join(' AND ')}
+       ORDER BY s.roll_number ASC`
     )
-    .all(search, search, search);
+    .all(...params);
   res.json({ students: rows });
 });
 
@@ -798,13 +877,16 @@ function loadStudentProfileRecord(userId: number) {
               d.code AS department_code, d.name AS department_name,
               c.code AS course_code, c.name AS course_name,
               sem.name AS semester_name, sem.term_order,
-              ay.label AS academic_year_label
+              ay.label AS academic_year_label,
+              pu.full_name AS proctor_name, pf.employee_code AS proctor_employee_code
        FROM students s
        JOIN users u ON u.id = s.user_id
        JOIN departments d ON d.id = s.department_id
        JOIN courses c ON c.id = s.course_id
        JOIN semesters sem ON sem.id = s.semester_id
        JOIN academic_years ay ON ay.id = s.academic_year_id
+       LEFT JOIN faculty pf ON pf.id = s.proctor_faculty_id
+       LEFT JOIN users pu ON pu.id = pf.user_id
        WHERE s.user_id = ?`
     )
     .get(userId) as
@@ -815,6 +897,9 @@ function loadStudentProfileRecord(userId: number) {
         course_id: number;
         academic_year_id: number;
         semester_id: number;
+        proctor_faculty_id: number | null;
+        proctor_name: string | null;
+        proctor_employee_code: string | null;
         roll_number: string;
         batch_year: number;
         email: string;
@@ -880,7 +965,7 @@ apiRouter.put('/students/profile', requireAuth, requireRole('student'), (req: Au
     if (!ENROLLMENT_FORMAT_REGEX.test(normalized)) {
       res.status(400).json({
         error:
-          'Enrollment number must match the 24SUUBECS001 format (2-digit year + SUU + program code + 3-digit roll).',
+          'Enrollment number (SRN) must match the 24SUUBECS0001 format (2-digit year + SUU + program code + 4-digit sequence).',
       });
       return;
     }
@@ -1015,18 +1100,24 @@ apiRouter.get('/students/dashboard', requireAuth, requireRole('student', 'admin'
   const student = db
     .prepare(
       `SELECT s.*, d.code AS department_code, d.name AS department_name, c.code AS course_code, c.name AS course_name,
-              sem.name AS semester_name, sem.term_order AS semester_term_order, ay.label AS academic_year_label
+              sem.name AS semester_name, sem.term_order AS semester_term_order, ay.label AS academic_year_label,
+              pu.full_name AS proctor_name, pf.employee_code AS proctor_employee_code
        FROM students s
        JOIN departments d ON d.id = s.department_id
        JOIN courses c ON c.id = s.course_id
        JOIN semesters sem ON sem.id = s.semester_id
        JOIN academic_years ay ON ay.id = s.academic_year_id
+       LEFT JOIN faculty pf ON pf.id = s.proctor_faculty_id
+       LEFT JOIN users pu ON pu.id = pf.user_id
        WHERE s.user_id = ?`
     )
     .get(req.user!.sub) as {
       id: number;
       department_id: number;
       course_id: number;
+      proctor_faculty_id: number | null;
+      proctor_name: string | null;
+      proctor_employee_code: string | null;
       department_code: string;
       department_name: string;
       course_code: string;
@@ -1061,6 +1152,29 @@ apiRouter.get('/students/dashboard', requireAuth, requireRole('student', 'admin'
            ORDER BY fs.updated_at DESC`
         )
         .all(student.id) as Array<{ form_id: number; status: string }>)
+    : [];
+
+  const pendingRequests = student
+    ? db
+        .prepare(
+          `SELECT fr.id, fr.form_id, fr.subject_id, fr.faculty_id, fr.status, fr.request_note, fr.requested_at, fr.completed_at,
+                  ff.title AS form_title, ff.close_date,
+                  sub.code AS subject_code, sub.short_code, sub.name AS subject_name,
+                  sem.name AS semester_name,
+                  fu.full_name AS faculty_name,
+                  pu.full_name AS proctor_name
+           FROM feedback_requests fr
+           JOIN feedback_forms ff ON ff.id = fr.form_id
+           JOIN subjects sub ON sub.id = fr.subject_id
+           JOIN semesters sem ON sem.id = sub.semester_id
+           LEFT JOIN faculty f ON f.id = fr.faculty_id
+           LEFT JOIN users fu ON fu.id = f.user_id
+           LEFT JOIN faculty pf ON pf.id = fr.proctor_faculty_id
+           LEFT JOIN users pu ON pu.id = pf.user_id
+           WHERE fr.student_id = ?
+           ORDER BY CASE fr.status WHEN 'pending' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END, fr.requested_at DESC`
+        )
+        .all(student.id)
     : [];
 
   const submittedCount = mySubmissions.filter((s) => s.status === 'submitted').length;
@@ -1103,6 +1217,7 @@ apiRouter.get('/students/dashboard', requireAuth, requireRole('student', 'admin'
     student,
     activeForms,
     mySubmissions,
+    pendingRequests,
     progress: { submittedCount, draftCount, totalAvailable, completionPercent },
     eightSemesterTracking,
     leaderboard,
@@ -1134,28 +1249,144 @@ apiRouter.get('/faculty', requireAuth, (_req, res) => {
   res.json({ faculty: rows });
 });
 
+function computeSubjectPollsForFaculty(facultyId: number) {
+  const rawResponses = db
+    .prepare(
+      `SELECT fq.id AS question_id, fq.form_id, ff.title AS form_title, fq.question_text,
+              fq.question_type, fq.category, fq.options_json,
+              fr.response_value, fr.numeric_score
+       FROM feedback_responses fr
+       JOIN feedback_questions fq ON fq.id = fr.question_id
+       JOIN feedback_forms ff ON ff.id = fq.form_id
+       JOIN feedback_submissions fs ON fs.id = fr.submission_id
+       WHERE fs.faculty_id = ? AND fs.status = 'submitted' AND fq.question_type IN ('radio', 'star', 'slider')
+       ORDER BY fq.form_id ASC, fq.sort_order ASC`
+    )
+    .all(facultyId) as Array<{
+    question_id: number;
+    form_id: number;
+    form_title: string;
+    question_text: string;
+    question_type: 'star' | 'slider' | 'radio' | 'text';
+    category: string;
+    options_json: string | null;
+    response_value: string;
+    numeric_score: number | null;
+  }>;
+
+  const grouped = new Map<
+    number,
+    {
+      question_id: number;
+      form_id: number;
+      form_title: string;
+      question_text: string;
+      question_type: 'star' | 'slider' | 'radio' | 'text';
+      category: string;
+      optionsSeed: string[];
+      counts: Map<string, number>;
+      numericSum: number;
+      numericCount: number;
+      totalVotes: number;
+    }
+  >();
+
+  for (const r of rawResponses) {
+    let bucket = grouped.get(r.question_id);
+    if (!bucket) {
+      let optionsSeed: string[] = [];
+      if (r.question_type === 'radio' && r.options_json) {
+        try {
+          optionsSeed = JSON.parse(r.options_json) as string[];
+        } catch {
+          optionsSeed = [];
+        }
+      } else if (r.question_type === 'star' || r.question_type === 'slider') {
+        optionsSeed = ['4.5 – 5.0 (Excellent)', '3.5 – 4.4 (Good)', '2.5 – 3.4 (Average)', '< 2.5 (Needs Focus)'];
+      }
+      const counts = new Map<string, number>();
+      optionsSeed.forEach((o) => counts.set(o, 0));
+      bucket = {
+        question_id: r.question_id,
+        form_id: r.form_id,
+        form_title: r.form_title,
+        question_text: r.question_text,
+        question_type: r.question_type,
+        category: r.category,
+        optionsSeed,
+        counts,
+        numericSum: 0,
+        numericCount: 0,
+        totalVotes: 0,
+      };
+      grouped.set(r.question_id, bucket);
+    }
+
+    bucket.totalVotes++;
+    if (r.question_type === 'radio') {
+      const label = (r.response_value || '').trim() || 'Other';
+      bucket.counts.set(label, (bucket.counts.get(label) ?? 0) + 1);
+    } else {
+      const num = Number.isFinite(Number(r.numeric_score)) ? Number(r.numeric_score) : Number(r.response_value);
+      if (Number.isFinite(num) && num > 0) {
+        bucket.numericSum += num;
+        bucket.numericCount++;
+        const tier =
+          num >= 4.5
+            ? '4.5 – 5.0 (Excellent)'
+            : num >= 3.5
+            ? '3.5 – 4.4 (Good)'
+            : num >= 2.5
+            ? '2.5 – 3.4 (Average)'
+            : '< 2.5 (Needs Focus)';
+        bucket.counts.set(tier, (bucket.counts.get(tier) ?? 0) + 1);
+      }
+    }
+  }
+
+  return Array.from(grouped.values()).map((g) => ({
+    question_id: g.question_id,
+    form_id: g.form_id,
+    form_title: g.form_title,
+    question_text: g.question_text,
+    question_type: g.question_type,
+    category: g.category,
+    total_votes: g.totalVotes,
+    avg_score: g.numericCount > 0 ? Math.round((g.numericSum / g.numericCount) * 100) / 100 : null,
+    options: Array.from(g.counts.entries()).map(([label, count]) => ({
+      label,
+      count,
+      percentage: g.totalVotes > 0 ? Math.round((count / g.totalVotes) * 100) : 0,
+    })),
+  }));
+}
+
 apiRouter.get('/faculty/dashboard', requireAuth, requireRole('faculty', 'admin'), (req: AuthenticatedRequest, res) => {
   let facultyRow = db
     .prepare(
-      `SELECT f.*, u.full_name, u.email, d.name AS department_name
+      `SELECT f.*, u.full_name, u.email, d.code AS department_code, d.name AS department_name
        FROM faculty f
        JOIN users u ON u.id = f.user_id
        JOIN departments d ON d.id = f.department_id
        WHERE f.user_id = ?`
     )
-    .get(req.user!.sub) as { id: number; full_name: string; department_name: string } | undefined;
+    .get(req.user!.sub) as
+    | { id: number; department_id: number; full_name: string; department_code: string; department_name: string }
+    | undefined;
 
-  if (!facultyRow && req.user!.role === 'admin') {
-    const requestedFacultyId = Number(req.query.facultyId) || 1;
+  if (req.user!.role === 'admin' || Number(req.query.facultyId) > 0) {
+    const requestedFacultyId = Number(req.query.facultyId) || (facultyRow?.id ?? 1);
     facultyRow = db
       .prepare(
-        `SELECT f.*, u.full_name, u.email, d.name AS department_name
+        `SELECT f.*, u.full_name, u.email, d.code AS department_code, d.name AS department_name
          FROM faculty f
          JOIN users u ON u.id = f.user_id
          JOIN departments d ON d.id = f.department_id
          WHERE f.id = ?`
       )
-      .get(requestedFacultyId) as { id: number; full_name: string; department_name: string } | undefined;
+      .get(requestedFacultyId) as
+      | { id: number; department_id: number; full_name: string; department_code: string; department_name: string }
+      | undefined;
   }
 
   if (!facultyRow) {
@@ -1163,11 +1394,26 @@ apiRouter.get('/faculty/dashboard', requireAuth, requireRole('faculty', 'admin')
     return;
   }
 
+  const allFaculty = db
+    .prepare(
+      `SELECT f.id, u.full_name, f.employee_code, d.code AS department_code, d.name AS department_name, f.designation
+       FROM faculty f
+       JOIN users u ON u.id = f.user_id
+       JOIN departments d ON d.id = f.department_id
+       ORDER BY u.full_name ASC`
+    )
+    .all();
+
   const assignedSubjects = db
     .prepare(
-      `SELECT sub.id, sub.code, sub.name, sub.credits, c.name AS course_name, sem.name AS semester_name,
+      `SELECT sub.id, sub.code, sub.short_code, sub.name, sub.credits, c.name AS course_name, sem.name AS semester_name,
               COUNT(DISTINCT CASE WHEN fs.status = 'submitted' THEN fs.id END) AS response_count,
-              ROUND(AVG(CASE WHEN fs.status = 'submitted' THEN r.overall_satisfaction END), 2) AS avg_satisfaction
+              ROUND(AVG(CASE WHEN fs.status = 'submitted' THEN r.overall_satisfaction END), 2) AS avg_satisfaction,
+              ROUND(AVG(CASE WHEN fs.status = 'submitted' THEN r.teaching_quality END), 2) AS avg_teaching,
+              ROUND(AVG(CASE WHEN fs.status = 'submitted' THEN r.infrastructure END), 2) AS avg_infrastructure,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.subject_id = sub.id AND fr.faculty_id = ?) AS requests_sent,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.subject_id = sub.id AND fr.faculty_id = ? AND fr.status = 'completed') AS completed_requests,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.subject_id = sub.id AND fr.faculty_id = ? AND fr.status != 'completed') AS pending_requests
        FROM subjects sub
        JOIN courses c ON c.id = sub.course_id
        JOIN semesters sem ON sem.id = sub.semester_id
@@ -1177,7 +1423,7 @@ apiRouter.get('/faculty/dashboard', requireAuth, requireRole('faculty', 'admin')
        GROUP BY sub.id
        ORDER BY sem.term_order DESC, sub.code ASC`
     )
-    .all(facultyRow.id, facultyRow.id);
+    .all(facultyRow.id, facultyRow.id, facultyRow.id, facultyRow.id, facultyRow.id);
 
   const metrics = db
     .prepare(
@@ -1195,6 +1441,33 @@ apiRouter.get('/faculty/dashboard', requireAuth, requireRole('faculty', 'admin')
     )
     .get(facultyRow.id);
 
+  const reqCounts = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS total_requests,
+         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_requests,
+         SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS in_progress_requests,
+         SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_requests
+       FROM feedback_requests
+       WHERE faculty_id = ?`
+    )
+    .get(facultyRow.id) as {
+    total_requests: number;
+    completed_requests: number | null;
+    in_progress_requests: number | null;
+    pending_requests: number | null;
+  };
+
+  const totalReqs = Number(reqCounts?.total_requests ?? 0);
+  const completedReqs = Number(reqCounts?.completed_requests ?? 0);
+  const requestStats = {
+    total_requests: totalReqs,
+    completed_requests: completedReqs,
+    in_progress_requests: Number(reqCounts?.in_progress_requests ?? 0),
+    pending_requests: Number(reqCounts?.pending_requests ?? 0),
+    completion_rate: totalReqs > 0 ? Math.round((completedReqs / totalReqs) * 100) : 0,
+  };
+
   const semesterTrend = db
     .prepare(
       `SELECT sem.name AS semester_name, sem.term_order,
@@ -1210,20 +1483,121 @@ apiRouter.get('/faculty/dashboard', requireAuth, requireRole('faculty', 'admin')
     )
     .all(facultyRow.id);
 
-  // Strict privacy: NEVER include student_id, student name, or email in faculty feedback list
+  // Privacy-safe online reviews for the assigned instructor (anonymous reviews mask identity; named reviews show student SRN + name)
   const anonymizedComments = db
     .prepare(
-      `SELECT fs.id, sub.code AS subject_code, sub.name AS subject_name, fs.comment_text,
-              r.overall_satisfaction, fs.submitted_at,
+      `SELECT fs.id, sub.code AS subject_code, sub.short_code, sub.name AS subject_name,
+              sem.name AS semester_name, fs.is_anonymous,
+              CASE WHEN fs.is_anonymous = 1 THEN 'Anonymous Respondent' ELSE (stu.roll_number || ' · ' || su.full_name) END AS respondent_display,
+              fs.comment_text,
+              r.overall_satisfaction, r.teaching_quality, r.communication, r.infrastructure,
+              fs.submitted_at,
               ai.sentiment, ai.primary_category
        FROM feedback_submissions fs
        JOIN subjects sub ON sub.id = fs.subject_id
+       JOIN semesters sem ON sem.id = sub.semester_id
+       JOIN students stu ON stu.id = fs.student_id
+       JOIN users su ON su.id = stu.user_id
        JOIN feedback_ratings r ON r.submission_id = fs.id
        LEFT JOIN ai_sentiment_analysis ai ON ai.submission_id = fs.id
        WHERE fs.faculty_id = ? AND fs.status = 'submitted'
        ORDER BY fs.submitted_at DESC`
     )
     .all(facultyRow.id);
+
+  const subjectPolls = computeSubjectPollsForFaculty(facultyRow.id);
+
+  // Proctor mentee student database & online request/review completion tracking
+  const proctorMentees = db
+    .prepare(
+      `SELECT stu.id AS student_id, stu.user_id, stu.roll_number, u.full_name, u.email,
+              d.code AS department_code, d.name AS department_name,
+              c.code AS course_code, sem.name AS semester_name, sem.term_order,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.student_id = stu.id) AS requests_given,
+              (SELECT COUNT(*) FROM feedback_submissions fs WHERE fs.student_id = stu.id AND fs.status = 'submitted') AS feedbacks_completed,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.student_id = stu.id AND fr.status = 'pending') AS feedbacks_pending,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.student_id = stu.id AND fr.status = 'in_progress') AS in_progress_count,
+              (SELECT MAX(fs.submitted_at) FROM feedback_submissions fs WHERE fs.student_id = stu.id) AS last_activity_at
+       FROM students stu
+       JOIN users u ON u.id = stu.user_id
+       JOIN departments d ON d.id = stu.department_id
+       JOIN courses c ON c.id = stu.course_id
+       JOIN semesters sem ON sem.id = stu.semester_id
+       WHERE stu.proctor_faculty_id = ?
+       ORDER BY stu.roll_number ASC`
+    )
+    .all(facultyRow.id);
+
+  // Proctor subject-wise analysis across mentee reviews & requests
+  const proctorSubjectAnalysis = db
+    .prepare(
+      `SELECT sub.id AS subject_id, sub.code AS subject_code, sub.short_code, sub.name AS subject_name,
+              sem.name AS semester_name, fu.full_name AS instructor_name,
+              (SELECT COUNT(*)
+               FROM feedback_requests fr
+               JOIN students s2 ON s2.id = fr.student_id
+               WHERE fr.subject_id = sub.id AND s2.proctor_faculty_id = ?) AS requests_count,
+              COUNT(DISTINCT CASE WHEN fs.status = 'submitted' THEN fs.id END) AS reviews_count,
+              ROUND(AVG(CASE WHEN fs.status = 'submitted' THEN r.teaching_quality END), 2) AS avg_teaching,
+              ROUND(AVG(CASE WHEN fs.status = 'submitted' THEN r.communication END), 2) AS avg_communication,
+              ROUND(AVG(CASE WHEN fs.status = 'submitted' THEN r.infrastructure END), 2) AS avg_infrastructure,
+              ROUND(AVG(CASE WHEN fs.status = 'submitted' THEN r.overall_satisfaction END), 2) AS avg_overall
+       FROM subjects sub
+       JOIN semesters sem ON sem.id = sub.semester_id
+       LEFT JOIN faculty f ON f.id = sub.faculty_id
+       LEFT JOIN users fu ON fu.id = f.user_id
+       JOIN feedback_submissions fs ON fs.subject_id = sub.id
+       JOIN students stu ON stu.id = fs.student_id AND stu.proctor_faculty_id = ?
+       LEFT JOIN feedback_ratings r ON r.submission_id = fs.id
+       WHERE fs.status = 'submitted'
+       GROUP BY sub.id
+       ORDER BY avg_overall DESC, reviews_count DESC`
+    )
+    .all(facultyRow.id, facultyRow.id);
+
+  // Proctor view of mentee reviews (still strictly respecting is_anonymous === 1!)
+  const proctorReviews = db
+    .prepare(
+      `SELECT fs.id, sub.code AS subject_code, sub.short_code, sub.name AS subject_name,
+              sem.name AS semester_name, fu.full_name AS instructor_name,
+              fs.is_anonymous,
+              CASE WHEN fs.is_anonymous = 1 THEN 'Anonymous Mentee' ELSE (stu.roll_number || ' · ' || su.full_name) END AS respondent_display,
+              fs.comment_text, r.overall_satisfaction, r.teaching_quality, r.infrastructure,
+              fs.submitted_at, ai.sentiment, ai.primary_category
+       FROM feedback_submissions fs
+       JOIN students stu ON stu.id = fs.student_id
+       JOIN users su ON su.id = stu.user_id
+       JOIN subjects sub ON sub.id = fs.subject_id
+       JOIN semesters sem ON sem.id = sub.semester_id
+       LEFT JOIN faculty f ON f.id = fs.faculty_id
+       LEFT JOIN users fu ON fu.id = f.user_id
+       JOIN feedback_ratings r ON r.submission_id = fs.id
+       LEFT JOIN ai_sentiment_analysis ai ON ai.submission_id = fs.id
+       WHERE stu.proctor_faculty_id = ? AND fs.status = 'submitted'
+       ORDER BY fs.submitted_at DESC`
+    )
+    .all(facultyRow.id);
+
+  // Full student database visible to faculty (department + cross-semester overview)
+  const studentDatabase = db
+    .prepare(
+      `SELECT stu.id AS student_id, stu.roll_number, u.full_name, u.email,
+              d.code AS department_code, d.name AS department_name,
+              c.code AS course_code, sem.name AS semester_name, sem.term_order,
+              pu.full_name AS proctor_name,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.student_id = stu.id) AS requests_given,
+              (SELECT COUNT(*) FROM feedback_submissions fs WHERE fs.student_id = stu.id AND fs.status = 'submitted') AS feedbacks_completed,
+              (SELECT COUNT(*) FROM feedback_requests fr WHERE fr.student_id = stu.id AND fr.status != 'completed') AS feedbacks_pending
+       FROM students stu
+       JOIN users u ON u.id = stu.user_id
+       JOIN departments d ON d.id = stu.department_id
+       JOIN courses c ON c.id = stu.course_id
+       JOIN semesters sem ON sem.id = stu.semester_id
+       LEFT JOIN faculty pf ON pf.id = stu.proctor_faculty_id
+       LEFT JOIN users pu ON pu.id = pf.user_id
+       ORDER BY stu.department_id ASC, sem.term_order ASC, stu.roll_number ASC`
+    )
+    .all();
 
   const recommendations = db
     .prepare(
@@ -1233,13 +1607,177 @@ apiRouter.get('/faculty/dashboard', requireAuth, requireRole('faculty', 'admin')
     )
     .all(facultyRow.id);
 
+  const activeForms = db
+    .prepare(`SELECT id, title, close_date, qr_token FROM feedback_forms WHERE is_active = 1 ORDER BY close_date ASC`)
+    .all();
+
   res.json({
     faculty: facultyRow,
+    allFaculty,
+    activeForms,
     assignedSubjects,
     metrics,
+    requestStats,
     semesterTrend,
     anonymizedComments,
+    subjectPolls,
+    proctorMentees,
+    proctorSubjectAnalysis,
+    proctorReviews,
+    studentDatabase,
     recommendations,
+  });
+});
+
+apiRouter.post('/faculty/requests/dispatch', requireAuth, requireRole('faculty', 'admin'), (req: AuthenticatedRequest, res) => {
+  const {
+    faculty_id,
+    form_id,
+    subject_id,
+    target_scope = 'subject_students',
+    semester_id,
+    request_note = 'Please complete your online course feedback evaluation.',
+  } = req.body ?? {};
+
+  let facultyRow = db
+    .prepare(`SELECT id, department_id FROM faculty WHERE user_id = ?`)
+    .get(req.user!.sub) as { id: number; department_id: number } | undefined;
+
+  if (!facultyRow && req.user!.role === 'admin' && Number(faculty_id) > 0) {
+    facultyRow = db
+      .prepare(`SELECT id, department_id FROM faculty WHERE id = ?`)
+      .get(Number(faculty_id)) as { id: number; department_id: number } | undefined;
+  }
+
+  if (!facultyRow) {
+    res.status(404).json({ error: 'Faculty profile not found.' });
+    return;
+  }
+
+  const formRow = (Number(form_id) > 0
+    ? db.prepare(`SELECT id, title FROM feedback_forms WHERE id = ?`).get(Number(form_id))
+    : db.prepare(`SELECT id, title FROM feedback_forms WHERE is_active = 1 ORDER BY id ASC LIMIT 1`).get()) as
+    | { id: number; title: string }
+    | undefined;
+  if (!formRow) {
+    res.status(404).json({ error: 'Active feedback form not found.' });
+    return;
+  }
+
+  const subjectRow = (Number(subject_id) > 0
+    ? db.prepare(`SELECT id, department_id, semester_id, faculty_id, name FROM subjects WHERE id = ?`).get(Number(subject_id))
+    : db.prepare(`SELECT id, department_id, semester_id, faculty_id, name FROM subjects WHERE faculty_id = ? ORDER BY id ASC LIMIT 1`).get(facultyRow.id)) as
+    | { id: number; department_id: number; semester_id: number; faculty_id: number | null; name: string }
+    | undefined;
+
+  if (!subjectRow) {
+    res.status(400).json({ error: 'Please select a valid subject to dispatch feedback requests.' });
+    return;
+  }
+
+  let targetStudents: Array<{ id: number; proctor_faculty_id: number | null }> = [];
+  if (target_scope === 'proctor_mentees') {
+    targetStudents = db
+      .prepare(`SELECT id, proctor_faculty_id FROM students WHERE proctor_faculty_id = ?`)
+      .all(facultyRow.id) as Array<{ id: number; proctor_faculty_id: number | null }>;
+  } else if (target_scope === 'semester_students' && Number(semester_id) > 0) {
+    targetStudents = db
+      .prepare(`SELECT id, proctor_faculty_id FROM students WHERE semester_id = ?`)
+      .all(Number(semester_id)) as Array<{ id: number; proctor_faculty_id: number | null }>;
+  } else if (target_scope === 'all_dept_students') {
+    targetStudents = db
+      .prepare(`SELECT id, proctor_faculty_id FROM students WHERE department_id = ?`)
+      .all(subjectRow.department_id) as Array<{ id: number; proctor_faculty_id: number | null }>;
+  } else {
+    targetStudents = db
+      .prepare(`SELECT id, proctor_faculty_id FROM students WHERE department_id = ? AND semester_id = ?`)
+      .all(subjectRow.department_id, subjectRow.semester_id) as Array<{ id: number; proctor_faculty_id: number | null }>;
+    if (targetStudents.length === 0) {
+      targetStudents = db
+        .prepare(`SELECT id, proctor_faculty_id FROM students WHERE department_id = ?`)
+        .all(subjectRow.department_id) as Array<{ id: number; proctor_faculty_id: number | null }>;
+    }
+  }
+
+  let inserted = 0;
+  let existingCount = 0;
+  const cleanNote = String(request_note || '').trim().slice(0, 400);
+
+  const tx = db.transaction(() => {
+    const checkReq = db.prepare(
+      `SELECT id FROM feedback_requests WHERE form_id = ? AND student_id = ? AND subject_id = ?`
+    );
+    const insReq = db.prepare(
+      `INSERT INTO feedback_requests (form_id, student_id, subject_id, faculty_id, proctor_faculty_id, status, request_note)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?)`
+    );
+    const checkSub = db.prepare(
+      `SELECT status FROM feedback_submissions WHERE form_id = ? AND student_id = ? AND subject_id = ?`
+    );
+
+    for (const stu of targetStudents) {
+      const exists = checkReq.get(formRow.id, stu.id, subjectRow.id);
+      if (exists) {
+        existingCount++;
+        continue;
+      }
+      const subExists = checkSub.get(formRow.id, stu.id, subjectRow.id) as { status: string } | undefined;
+      if (subExists) {
+        db.prepare(
+          `INSERT INTO feedback_requests (form_id, student_id, subject_id, faculty_id, proctor_faculty_id, status, request_note, completed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'submitted' THEN datetime('now') ELSE NULL END)`
+        ).run(
+          formRow.id,
+          stu.id,
+          subjectRow.id,
+          subjectRow.faculty_id ?? facultyRow!.id,
+          stu.proctor_faculty_id,
+          subExists.status === 'submitted' ? 'completed' : 'in_progress',
+          cleanNote,
+          subExists.status
+        );
+      } else {
+        insReq.run(
+          formRow.id,
+          stu.id,
+          subjectRow.id,
+          subjectRow.faculty_id ?? facultyRow!.id,
+          stu.proctor_faculty_id,
+          cleanNote
+        );
+      }
+      inserted++;
+    }
+
+    if (inserted > 0) {
+      db.prepare(
+        `INSERT INTO notifications (target_role, title, message, category) VALUES ('student', ?, ?, 'campaign')`
+      ).run(
+        `Feedback Request: ${subjectRow.name}`,
+        `${inserted} online evaluation request(s) opened under "${formRow.title}".`
+      );
+    }
+  });
+
+  tx();
+  logAudit({
+    userId: req.user!.sub,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'FEEDBACK_REQUESTS_DISPATCHED',
+    entityType: 'feedback_requests',
+    entityId: subjectRow.id,
+    details: { form_id: formRow.id, subject_id: subjectRow.id, target_scope, inserted, existingCount },
+    ipAddress: req.ip,
+  });
+
+  res.status(201).json({
+    dispatched_count: inserted,
+    already_requested: existingCount,
+    message:
+      inserted > 0
+        ? `Dispatched ${inserted} online feedback request(s) for ${subjectRow.name}.`
+        : `All ${existingCount} targeted student(s) already have active feedback requests for ${subjectRow.name}.`,
   });
 });
 
@@ -1338,7 +1876,9 @@ apiRouter.post('/feedback/submit', requireAuth, requireRole('student'), async (r
     responses = [],
   } = req.body ?? {};
 
-  const student = db.prepare('SELECT id FROM students WHERE user_id = ?').get(req.user!.sub) as { id: number } | undefined;
+  const student = db
+    .prepare('SELECT id, proctor_faculty_id FROM students WHERE user_id = ?')
+    .get(req.user!.sub) as { id: number; proctor_faculty_id: number | null } | undefined;
   if (!student) {
     res.status(403).json({ error: 'Student enrollment record not found.' });
     return;
@@ -1408,7 +1948,7 @@ apiRouter.post('/feedback/submit', requireAuth, requireRole('student'), async (r
     return;
   }
 
-  const generatedReceiptToken = `SNU-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+  const generatedReceiptToken = `SNPSU-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
 
   const tx = db.transaction(() => {
     let submissionId: number;
@@ -1477,6 +2017,18 @@ apiRouter.post('/feedback/submit', requireAuth, requireRole('student'), async (r
         }
       }
     }
+
+    const reqStatus = cleanStatus === 'draft' ? 'in_progress' : 'completed';
+    db.prepare(
+      `INSERT INTO feedback_requests (form_id, student_id, subject_id, faculty_id, proctor_faculty_id, status, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, CASE WHEN ? = 'completed' THEN datetime('now') ELSE NULL END)
+       ON CONFLICT(form_id, student_id, subject_id) DO UPDATE SET
+         faculty_id = excluded.faculty_id,
+         proctor_faculty_id = COALESCE(excluded.proctor_faculty_id, feedback_requests.proctor_faculty_id),
+         status = excluded.status,
+         completed_at = CASE WHEN excluded.status = 'completed' THEN datetime('now') ELSE feedback_requests.completed_at END,
+         updated_at = datetime('now')`
+    ).run(form.id, student.id, subject.id, subject.faculty_id, student.proctor_faculty_id, reqStatus, reqStatus);
 
     return submissionId;
   });
@@ -1619,7 +2171,7 @@ apiRouter.get('/feedback/receipt/verify', (req, res) => {
   const rawId = typeof req.query.id === 'string' ? req.query.id.trim() : '';
   const token = typeof req.query.token === 'string' ? req.query.token.trim() : '';
 
-  const receiptMatch = rawReceipt.match(/^(?:SNU-REC-)?0*(\d+)$/i);
+  const receiptMatch = rawReceipt.match(/^(?:SNPSU-REC-|SNU-REC-)?0*(\d+)$/i);
   const submissionId = receiptMatch ? Number(receiptMatch[1]) : Number(rawId);
 
   if (!Number.isInteger(submissionId) || submissionId <= 0 || !token) {
@@ -1669,7 +2221,7 @@ apiRouter.get('/feedback/receipt/verify', (req, res) => {
   }
 
   const isAnon = Number(row.is_anonymous) === 1;
-  const receiptNumber = `SNU-REC-${String(row.id).padStart(5, '0')}`;
+  const receiptNumber = `SNPSU-REC-${String(row.id).padStart(5, '0')}`;
 
   res.json({
     receipt: {
@@ -1718,7 +2270,7 @@ apiRouter.get('/feedback/submissions/:id/qr', requireAuth, async (req: Authentic
   }
 
   const row = lookup.row!;
-  const receiptNumber = `SNU-REC-${String(row.id).padStart(5, '0')}`;
+  const receiptNumber = `SNPSU-REC-${String(row.id).padStart(5, '0')}`;
   const receiptToken = ensureSubmissionReceiptToken(Number(row.id), row.receipt_token);
   const origin = resolvePublicOrigin(req);
   const verifyUrl = `${origin}/?receipt=${encodeURIComponent(receiptNumber)}&token=${encodeURIComponent(receiptToken)}`;
@@ -1757,7 +2309,7 @@ apiRouter.get('/feedback/submissions/:id/receipt/pdf', requireAuth, async (req: 
   }
 
   const row = lookup.row!;
-  const receiptNumber = `SNU-REC-${String(row.id).padStart(5, '0')}`;
+  const receiptNumber = `SNPSU-REC-${String(row.id).padStart(5, '0')}`;
   const receiptToken = ensureSubmissionReceiptToken(Number(row.id), row.receipt_token);
   const origin = resolvePublicOrigin(req);
   const verifyUrl = `${origin}/?receipt=${encodeURIComponent(receiptNumber)}&token=${encodeURIComponent(receiptToken)}`;
@@ -1770,7 +2322,7 @@ apiRouter.get('/feedback/submissions/:id/receipt/pdf', requireAuth, async (req: 
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader(
     'Content-Disposition',
-    `attachment; filename="SNU_Receipt_${String(row.subject_code)}_${row.id}.pdf"`
+    `attachment; filename="SNPSU_Receipt_${String(row.subject_code)}_${row.id}.pdf"`
   );
 
   const doc = new PDFDocument({ margin: 48, size: 'A4' });
@@ -1876,7 +2428,7 @@ apiRouter.get('/feedback/history/export/csv', requireAuth, requireRole('student'
   for (const r of rows) {
     lines.push(
       [
-        `SNU-REC-${String(r.id).padStart(5, '0')}`,
+        `SNPSU-REC-${String(r.id).padStart(5, '0')}`,
         student.roll_number,
         r.semester_name,
         r.subject_code,
@@ -2043,7 +2595,7 @@ apiRouter.post('/admin/feedback-forms', requireAuth, requireRole('admin'), (req:
     return;
   }
 
-  const qrToken = `SNU-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+  const qrToken = `SNPSU-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
   const currentAy = db.prepare('SELECT id FROM academic_years WHERE is_current = 1 LIMIT 1').get() as { id: number } | undefined;
   const currentSem = db.prepare('SELECT id FROM semesters WHERE is_current = 1 LIMIT 1').get() as { id: number } | undefined;
   const ayId = Number(academic_year_id) || currentAy?.id || 1;
@@ -2331,6 +2883,123 @@ apiRouter.post('/admin/faculty', requireAuth, requireRole('admin'), (req: Authen
   }
 });
 
+apiRouter.post('/admin/students', requireAuth, requireRole('admin'), (req: AuthenticatedRequest, res) => {
+  const {
+    full_name,
+    email,
+    password,
+    department_id,
+    course_id,
+    semester_id,
+    proctor_faculty_id,
+    roll_number,
+    batch_year = 2024,
+    preferred_language = 'en',
+  } = req.body ?? {};
+
+  const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  const cleanName = typeof full_name === 'string' ? full_name.trim() : '';
+  const cleanPass = typeof password === 'string' && password.length >= 8 ? password : 'Meridian@2026';
+  const cleanRoll = typeof roll_number === 'string' ? roll_number.trim().toUpperCase() : '';
+  const lang = ['en', 'hi', 'kn', 'te'].includes(preferred_language) ? preferred_language : 'en';
+
+  if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail) || !cleanName) {
+    res.status(400).json({ error: 'Valid student email and full name are required.' });
+    return;
+  }
+  if (cleanRoll && !ENROLLMENT_FORMAT_REGEX.test(cleanRoll)) {
+    res.status(400).json({
+      error: 'SRN must match the 4-digit 24SUUBECS0001 format (2-digit year + SUU + program code + 4-digit sequence).',
+    });
+    return;
+  }
+
+  const deptRow = db.prepare(`SELECT id, code FROM departments WHERE id = ?`).get(Number(department_id) || 1) as
+    | { id: number; code: string }
+    | undefined;
+  if (!deptRow) {
+    res.status(400).json({ error: 'Selected department does not exist.' });
+    return;
+  }
+  const courseRow = (Number(course_id) > 0
+    ? db.prepare(`SELECT id FROM courses WHERE id = ?`).get(Number(course_id))
+    : db.prepare(`SELECT id FROM courses WHERE department_id = ? ORDER BY id ASC LIMIT 1`).get(deptRow.id)) as
+    | { id: number }
+    | undefined;
+  const semRow = (Number(semester_id) > 0
+    ? db.prepare(`SELECT id, academic_year_id FROM semesters WHERE id = ?`).get(Number(semester_id))
+    : db.prepare(`SELECT id, academic_year_id FROM semesters WHERE is_current = 1 LIMIT 1`).get()) as
+    | { id: number; academic_year_id: number }
+    | undefined;
+  if (!courseRow || !semRow) {
+    res.status(400).json({ error: 'Valid course and semester (1–8) are required.' });
+    return;
+  }
+
+  const parsedBatch = Number(batch_year) || 2024;
+  const finalRoll = cleanRoll || generateEnrollmentNumber(deptRow.code, parsedBatch);
+  const proctorId = resolveDefaultProctorForDepartment(deptRow.id, Number(proctor_faculty_id));
+
+  try {
+    const tx = db.transaction(() => {
+      const uRes = db
+        .prepare(`INSERT INTO users (email, password_hash, full_name, role, preferred_language) VALUES (?, ?, ?, 'student', ?)`)
+        .run(cleanEmail, hashPassword(cleanPass), cleanName, lang);
+      const userId = Number(uRes.lastInsertRowid);
+
+      const sRes = db
+        .prepare(
+          `INSERT INTO students (user_id, department_id, course_id, academic_year_id, semester_id, proctor_faculty_id, roll_number, batch_year)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(userId, deptRow.id, courseRow.id, semRow.academic_year_id, semRow.id, proctorId, finalRoll, parsedBatch);
+      const studentId = Number(sRes.lastInsertRowid);
+
+      seedInitialFeedbackRequestsForStudent(studentId, deptRow.id, semRow.id, proctorId);
+      return studentId;
+    });
+
+    const studentId = tx();
+    logAudit({
+      userId: req.user!.sub,
+      userEmail: req.user!.email,
+      userRole: 'admin',
+      action: 'STUDENT_CREATED_BY_ADMIN',
+      entityType: 'students',
+      entityId: studentId,
+      details: { roll_number: finalRoll, department_id: deptRow.id, semester_id: semRow.id, proctor_faculty_id: proctorId },
+      ipAddress: req.ip,
+    });
+    res.status(201).json({ id: studentId, roll_number: finalRoll, message: `Student ${finalRoll} saved to database.` });
+  } catch (err) {
+    res.status(409).json({ error: err instanceof Error ? err.message : 'Student email or SRN already exists.' });
+  }
+});
+
+apiRouter.put('/admin/students/:id/proctor', requireAuth, requireRole('admin'), (req: AuthenticatedRequest, res) => {
+  const studentId = Number(req.params.id);
+  const proctorId = Number(req.body?.proctor_faculty_id) || null;
+  db.prepare(`UPDATE students SET proctor_faculty_id = ?, updated_at = datetime('now') WHERE id = ?`).run(
+    proctorId,
+    studentId
+  );
+  db.prepare(`UPDATE feedback_requests SET proctor_faculty_id = ?, updated_at = datetime('now') WHERE student_id = ?`).run(
+    proctorId,
+    studentId
+  );
+  logAudit({
+    userId: req.user!.sub,
+    userEmail: req.user!.email,
+    userRole: 'admin',
+    action: 'STUDENT_PROCTOR_ASSIGNED',
+    entityType: 'students',
+    entityId: studentId,
+    details: { proctor_faculty_id: proctorId },
+    ipAddress: req.ip,
+  });
+  res.json({ message: 'Student proctor updated.' });
+});
+
 apiRouter.put('/admin/users/:id/role', requireAuth, requireRole('admin'), (req: AuthenticatedRequest, res) => {
   const id = Number(req.params.id);
   const { role, is_active } = req.body ?? {};
@@ -2595,6 +3264,205 @@ function computeFullAnalytics(filters: FilterParams) {
     )
     .all(...params);
 
+  // Online Feedback Requests Overview & Per-Faculty Breakdown
+  const reqClauses: string[] = ['1 = 1'];
+  const reqParams: unknown[] = [];
+  if (filters.departmentId) {
+    reqClauses.push('sub.department_id = ?');
+    reqParams.push(filters.departmentId);
+  }
+  if (filters.courseId) {
+    reqClauses.push('sub.course_id = ?');
+    reqParams.push(filters.courseId);
+  }
+  if (filters.facultyId) {
+    reqClauses.push('fr.faculty_id = ?');
+    reqParams.push(filters.facultyId);
+  }
+  if (filters.subjectId) {
+    reqClauses.push('fr.subject_id = ?');
+    reqParams.push(filters.subjectId);
+  }
+  if (filters.academicYearId) {
+    reqClauses.push('ff.academic_year_id = ?');
+    reqParams.push(filters.academicYearId);
+  }
+  if (filters.semesterId) {
+    reqClauses.push('sub.semester_id = ?');
+    reqParams.push(filters.semesterId);
+  }
+  const reqWhereSql = reqClauses.join(' AND ');
+
+  const rawRequestOv = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS total_requests,
+         SUM(CASE WHEN fr.status = 'completed' THEN 1 ELSE 0 END) AS completed_requests,
+         SUM(CASE WHEN fr.status = 'in_progress' THEN 1 ELSE 0 END) AS in_progress_requests,
+         SUM(CASE WHEN fr.status = 'pending' THEN 1 ELSE 0 END) AS pending_requests
+       FROM feedback_requests fr
+       JOIN subjects sub ON sub.id = fr.subject_id
+       JOIN feedback_forms ff ON ff.id = fr.form_id
+       WHERE ${reqWhereSql}`
+    )
+    .get(...reqParams) as {
+    total_requests: number;
+    completed_requests: number | null;
+    in_progress_requests: number | null;
+    pending_requests: number | null;
+  };
+
+  const totalRequests = Number(rawRequestOv?.total_requests ?? 0);
+  const completedRequests = Number(rawRequestOv?.completed_requests ?? 0);
+  const requestOverview = {
+    total_requests: totalRequests,
+    completed_requests: completedRequests,
+    in_progress_requests: Number(rawRequestOv?.in_progress_requests ?? 0),
+    pending_requests: Number(rawRequestOv?.pending_requests ?? 0),
+    response_rate_pct: totalRequests > 0 ? Math.round((completedRequests / totalRequests) * 100) : 0,
+  };
+
+  const facultyRequestRows = db
+    .prepare(
+      `SELECT f.id AS faculty_id, u.full_name AS faculty_name, f.employee_code, d.code AS dept_code,
+              (SELECT COUNT(*) FROM subjects s2 WHERE s2.faculty_id = f.id) AS assigned_subjects,
+              COUNT(DISTINCT fr.id) AS total_requests,
+              COUNT(DISTINCT CASE WHEN fr.status = 'completed' THEN fr.id END) AS completed_feedbacks,
+              COUNT(DISTINCT CASE WHEN fr.status = 'in_progress' THEN fr.id END) AS in_progress_requests,
+              COUNT(DISTINCT CASE WHEN fr.status = 'pending' THEN fr.id END) AS pending_requests,
+              ROUND(
+                CASE WHEN COUNT(DISTINCT fr.id) = 0 THEN 0
+                ELSE COUNT(DISTINCT CASE WHEN fr.status = 'completed' THEN fr.id END) * 100.0 / COUNT(DISTINCT fr.id)
+                END, 1
+              ) AS response_rate_pct,
+              (SELECT ROUND(AVG(r2.overall_satisfaction), 2)
+               FROM feedback_submissions fs2
+               JOIN feedback_ratings r2 ON r2.submission_id = fs2.id
+               WHERE fs2.faculty_id = f.id AND fs2.status = 'submitted') AS avg_overall
+       FROM faculty f
+       JOIN users u ON u.id = f.user_id
+       JOIN departments d ON d.id = f.department_id
+       LEFT JOIN feedback_requests fr ON fr.faculty_id = f.id
+       WHERE (? IS NULL OR f.id = ?) AND (? IS NULL OR f.department_id = ?)
+       GROUP BY f.id
+       ORDER BY total_requests DESC, completed_feedbacks DESC, u.full_name ASC`
+    )
+    .all(
+      filters.facultyId ?? null,
+      filters.facultyId ?? null,
+      filters.departmentId ?? null,
+      filters.departmentId ?? null
+    );
+
+  // Institutional / Filtered Poll Breakdown
+  const rawPolls = db
+    .prepare(
+      `SELECT fq.id AS question_id, fq.form_id, ff.title AS form_title, fq.question_text,
+              fq.question_type, fq.category, fq.options_json,
+              fr.response_value, fr.numeric_score
+       FROM feedback_responses fr
+       JOIN feedback_questions fq ON fq.id = fr.question_id
+       JOIN feedback_submissions fs ON fs.id = fr.submission_id
+       JOIN subjects sub ON sub.id = fs.subject_id
+       JOIN feedback_forms ff ON ff.id = fs.form_id
+       WHERE ${sql} AND fq.question_type IN ('radio', 'star', 'slider')
+       ORDER BY fq.form_id ASC, fq.sort_order ASC`
+    )
+    .all(...params) as Array<{
+    question_id: number;
+    form_id: number;
+    form_title: string;
+    question_text: string;
+    question_type: 'star' | 'slider' | 'radio' | 'text';
+    category: string;
+    options_json: string | null;
+    response_value: string;
+    numeric_score: number | null;
+  }>;
+
+  const pollMap = new Map<
+    number,
+    {
+      question_id: number;
+      form_id: number;
+      form_title: string;
+      question_text: string;
+      question_type: 'star' | 'slider' | 'radio' | 'text';
+      category: string;
+      counts: Map<string, number>;
+      numericSum: number;
+      numericCount: number;
+      totalVotes: number;
+    }
+  >();
+
+  for (const r of rawPolls) {
+    let p = pollMap.get(r.question_id);
+    if (!p) {
+      let seedOpts: string[] = [];
+      if (r.question_type === 'radio' && r.options_json) {
+        try {
+          seedOpts = JSON.parse(r.options_json) as string[];
+        } catch {
+          seedOpts = [];
+        }
+      } else {
+        seedOpts = ['4.5 – 5.0 (Excellent)', '3.5 – 4.4 (Good)', '2.5 – 3.4 (Average)', '< 2.5 (Needs Focus)'];
+      }
+      const counts = new Map<string, number>();
+      seedOpts.forEach((o) => counts.set(o, 0));
+      p = {
+        question_id: r.question_id,
+        form_id: r.form_id,
+        form_title: r.form_title,
+        question_text: r.question_text,
+        question_type: r.question_type,
+        category: r.category,
+        counts,
+        numericSum: 0,
+        numericCount: 0,
+        totalVotes: 0,
+      };
+      pollMap.set(r.question_id, p);
+    }
+    p.totalVotes++;
+    if (r.question_type === 'radio') {
+      const label = (r.response_value || '').trim() || 'Other';
+      p.counts.set(label, (p.counts.get(label) ?? 0) + 1);
+    } else {
+      const num = Number.isFinite(Number(r.numeric_score)) ? Number(r.numeric_score) : Number(r.response_value);
+      if (Number.isFinite(num) && num > 0) {
+        p.numericSum += num;
+        p.numericCount++;
+        const tier =
+          num >= 4.5
+            ? '4.5 – 5.0 (Excellent)'
+            : num >= 3.5
+            ? '3.5 – 4.4 (Good)'
+            : num >= 2.5
+            ? '2.5 – 3.4 (Average)'
+            : '< 2.5 (Needs Focus)';
+        p.counts.set(tier, (p.counts.get(tier) ?? 0) + 1);
+      }
+    }
+  }
+
+  const pollSummaryRows = Array.from(pollMap.values()).map((g) => ({
+    question_id: g.question_id,
+    form_id: g.form_id,
+    form_title: g.form_title,
+    question_text: g.question_text,
+    question_type: g.question_type,
+    category: g.category,
+    total_votes: g.totalVotes,
+    avg_score: g.numericCount > 0 ? Math.round((g.numericSum / g.numericCount) * 100) / 100 : null,
+    options: Array.from(g.counts.entries()).map(([label, count]) => ({
+      label,
+      count,
+      percentage: g.totalVotes > 0 ? Math.round((count / g.totalVotes) * 100) : 0,
+    })),
+  }));
+
   return {
     overview,
     sentimentRows,
@@ -2607,6 +3475,9 @@ function computeFullAnalytics(filters: FilterParams) {
     reportedIssues: aiIssueRows.length > 0 ? aiIssueRows : dimensionIssues,
     aiCategoryRows,
     improvementDelta,
+    requestOverview,
+    facultyRequestRows,
+    pollSummaryRows,
   };
 }
 

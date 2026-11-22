@@ -10,7 +10,12 @@ import {
 } from 'lucide-react';
 import { apiRequest } from '../api.ts';
 import { ChartCard } from './ChartCard.tsx';
-import type { AuthUser, CatalogData } from '../types.ts';
+import type {
+  AuthUser,
+  CatalogData,
+  FacultyRequestAnalyticsRow,
+  SubjectPollItem,
+} from '../types.ts';
 
 interface AnalyticsSuiteResponse {
   overview: {
@@ -37,6 +42,15 @@ interface AnalyticsSuiteResponse {
   reportedIssues: Array<{ category: string; count: number }>;
   aiCategoryRows: Array<{ category: string; positive: number; neutral: number; negative: number }>;
   improvementDelta: number;
+  requestOverview?: {
+    total_requests: number;
+    completed_requests: number;
+    in_progress_requests: number;
+    pending_requests: number;
+    response_rate_pct: number;
+  };
+  facultyRequestRows?: FacultyRequestAnalyticsRow[];
+  pollSummaryRows?: SubjectPollItem[];
 }
 
 interface AnalyticsViewProps {
@@ -361,6 +375,36 @@ export function AnalyticsView({ catalog, isDark }: AnalyticsViewProps) {
         },
         options: { scales: { y: { min: 0, max: 5 } } },
       },
+      // 13. Faculty Online Requests Given vs Completed Feedbacks
+      facultyRequestsBar: {
+        type: 'bar' as const,
+        data: {
+          labels: (data.facultyRequestRows ?? []).slice(0, 12).map((f) =>
+            f.faculty_name.replace(/^Dr\.\s|^DR\.\s|^Prof\.\s/, '')
+          ),
+          datasets: [
+            {
+              label: 'Online Requests Given',
+              data: (data.facultyRequestRows ?? []).slice(0, 12).map((f) => f.total_requests),
+              backgroundColor: '#1E40AF',
+              borderRadius: 6,
+            },
+            {
+              label: 'Completed Feedbacks',
+              data: (data.facultyRequestRows ?? []).slice(0, 12).map((f) => f.completed_feedbacks),
+              backgroundColor: '#16A34A',
+              borderRadius: 6,
+            },
+            {
+              label: 'Pending Requests',
+              data: (data.facultyRequestRows ?? []).slice(0, 12).map((f) => f.pending_requests),
+              backgroundColor: '#D97706',
+              borderRadius: 6,
+            },
+          ],
+        },
+        options: { scales: { y: { beginAtZero: true } } },
+      },
     };
   }, [data]);
 
@@ -541,7 +585,37 @@ export function AnalyticsView({ catalog, isDark }: AnalyticsViewProps) {
         </div>
       )}
 
-      {/* All 12 Chart.js Visualizations */}
+      {/* Online Feedback Request & Response Strip */}
+      {data?.requestOverview && (
+        <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+          <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#111C2E]">
+            <p className="text-xs text-slate-500 dark:text-slate-400">Online Requests Given</p>
+            <p className="mt-1 font-mono text-2xl font-bold text-[#1E40AF] tabular-nums dark:text-blue-400">
+              {data.requestOverview.total_requests}
+            </p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#111C2E]">
+            <p className="text-xs text-slate-500 dark:text-slate-400">Completed Feedbacks</p>
+            <p className="mt-1 font-mono text-2xl font-bold text-emerald-600 tabular-nums dark:text-emerald-400">
+              {data.requestOverview.completed_requests}
+            </p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#111C2E]">
+            <p className="text-xs text-slate-500 dark:text-slate-400">Pending / Draft Requests</p>
+            <p className="mt-1 font-mono text-2xl font-bold text-amber-600 tabular-nums dark:text-amber-400">
+              {data.requestOverview.pending_requests + data.requestOverview.in_progress_requests}
+            </p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-[#111C2E]">
+            <p className="text-xs text-slate-500 dark:text-slate-400">Request Completion Rate</p>
+            <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums dark:text-white">
+              {data.requestOverview.response_rate_pct}%
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* All 12 Chart.js Visualizations + Faculty Online Request Comparison */}
       {charts && (
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
           <ChartCard
@@ -618,6 +692,125 @@ export function AnalyticsView({ catalog, isDark }: AnalyticsViewProps) {
             isDark={isDark}
             badgeText={`${data && data.improvementDelta >= 0 ? '+' : ''}${data?.improvementDelta ?? 0}`}
           />
+          {(data?.facultyRequestRows?.length ?? 0) > 0 && (
+            <div className="lg:col-span-2">
+              <ChartCard
+                title="13. Faculty Online Requests Given vs. Completed Feedbacks"
+                subtitle="Per-faculty student evaluation requests issued, completed, and pending"
+                config={charts.facultyRequestsBar}
+                isDark={isDark}
+                badgeText={`${data?.requestOverview?.response_rate_pct ?? 0}% Response`}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Faculty Online Requests & Feedback Completion Table */}
+      {(data?.facultyRequestRows?.length ?? 0) > 0 && (
+        <div className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-[#111C2E]">
+          <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+            Faculty Online Requests &amp; Feedback Completion Analysis
+          </h3>
+          <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+            Tracks how many online student feedback requests were assigned per faculty instructor versus completed responses.
+          </p>
+          <div className="mt-4 overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="border-b border-slate-200 text-slate-500 dark:border-slate-800 dark:text-slate-400">
+                  <th className="py-2 font-medium">Faculty Member</th>
+                  <th className="py-2 font-medium">Dept</th>
+                  <th className="py-2 text-right font-medium">Subjects</th>
+                  <th className="py-2 text-right font-medium">Requests Given</th>
+                  <th className="py-2 text-right font-medium">Completed</th>
+                  <th className="py-2 text-right font-medium">Pending</th>
+                  <th className="py-2 text-right font-medium">Response Rate</th>
+                  <th className="py-2 text-right font-medium">Mean Score</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                {data!.facultyRequestRows!.map((row) => (
+                  <tr key={row.faculty_id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                    <td className="py-2.5 pr-3 font-medium text-slate-900 dark:text-slate-100">
+                      {row.faculty_name}{' '}
+                      <span className="font-mono text-[11px] text-slate-400">({row.employee_code})</span>
+                    </td>
+                    <td className="py-2.5 pr-3 font-mono text-slate-600 dark:text-slate-300">{row.dept_code}</td>
+                    <td className="py-2.5 pr-3 text-right font-mono tabular-nums">{row.assigned_subjects}</td>
+                    <td className="py-2.5 pr-3 text-right font-mono font-semibold tabular-nums text-[#1E40AF] dark:text-blue-400">
+                      {row.total_requests}
+                    </td>
+                    <td className="py-2.5 pr-3 text-right font-mono font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
+                      {row.completed_feedbacks}
+                    </td>
+                    <td className="py-2.5 pr-3 text-right font-mono tabular-nums text-amber-600 dark:text-amber-400">
+                      {row.pending_requests + row.in_progress_requests}
+                    </td>
+                    <td className="py-2.5 pr-3 text-right font-mono font-semibold tabular-nums">
+                      {row.response_rate_pct}%
+                    </td>
+                    <td className="py-2.5 text-right font-mono font-semibold tabular-nums text-[#1E40AF] dark:text-blue-400">
+                      {row.avg_overall ? `${Number(row.avg_overall).toFixed(2)} / 5` : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Campaign Poll Results Summary */}
+      {(data?.pollSummaryRows?.length ?? 0) > 0 && (
+        <div className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-[#111C2E]">
+          <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+            Student Poll Responses Across Active Campaigns
+          </h3>
+          <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+            Live poll vote distributions and average question scores from submitted evaluations.
+          </p>
+          <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+            {data!.pollSummaryRows!.map((poll) => (
+              <div
+                key={poll.question_id}
+                className="rounded-lg border border-slate-200 p-4 dark:border-slate-800"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <p className="font-mono text-[10px] uppercase text-[#1E40AF] dark:text-blue-400">
+                      {poll.form_title} · {poll.category}
+                    </p>
+                    <p className="mt-1 text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      {poll.question_text}
+                    </p>
+                  </div>
+                  <span className="shrink-0 font-mono text-[11px] font-semibold text-slate-500">
+                    {poll.total_votes} votes
+                    {poll.avg_score ? ` · ${poll.avg_score}/5` : ''}
+                  </span>
+                </div>
+                <div className="mt-3 space-y-2">
+                  {poll.options.map((opt) => (
+                    <div key={opt.label} className="space-y-1">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-slate-700 dark:text-slate-300">{opt.label}</span>
+                        <span className="font-mono font-semibold text-slate-800 tabular-nums dark:text-slate-200">
+                          {opt.count} ({opt.percentage}%)
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                        <div
+                          className="h-full rounded-full bg-[#1E40AF] dark:bg-blue-500"
+                          style={{ width: `${opt.percentage}%` }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>

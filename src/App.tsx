@@ -50,6 +50,7 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   const [preselectedFormId, setPreselectedFormId] = useState<number | null>(null);
+  const [preselectedSubjectId, setPreselectedSubjectId] = useState<number | null>(null);
   const [editingEntry, setEditingEntry] = useState<HistoryRow | null>(null);
   const [pendingQrToken, setPendingQrToken] = useState<string | null>(null);
   const [receiptVerifyParams, setReceiptVerifyParams] = useState<{ receipt: string; token: string } | null>(null);
@@ -115,6 +116,7 @@ export default function App() {
     setUser(null);
     setEditingEntry(null);
     setPreselectedFormId(null);
+    setPreselectedSubjectId(null);
     setPage('landing');
   }
 
@@ -248,6 +250,7 @@ export default function App() {
   const navigateTo = (target: PageId) => {
     if (target !== 'feedback-submit') {
       setEditingEntry(null);
+      setPreselectedSubjectId(null);
     }
     setPage(target);
     setMobileMenuOpen(false);
@@ -392,8 +395,9 @@ export default function App() {
           {page === 'student-dashboard' && (
             <StudentDashboardView
               onNavigate={navigateTo}
-              onSelectFormForSubmission={(formId, _subjectId, editRow) => {
+              onSelectFormForSubmission={(formId, subjectId, editRow) => {
                 setPreselectedFormId(formId);
+                setPreselectedSubjectId(subjectId || null);
                 setEditingEntry(editRow || null);
                 setPage('feedback-submit');
               }}
@@ -406,6 +410,7 @@ export default function App() {
               language={language}
               onChangeLanguage={setLanguage}
               preselectedFormId={preselectedFormId}
+              preselectedSubjectId={preselectedSubjectId}
               editingEntry={editingEntry}
               onDoneNavigate={navigateTo}
             />
@@ -415,11 +420,13 @@ export default function App() {
             <FeedbackHistoryView
               onStartNew={() => {
                 setEditingEntry(null);
+                setPreselectedSubjectId(null);
                 setPage('feedback-submit');
               }}
               onEditSubmission={(row) => {
                 setEditingEntry(row);
                 setPreselectedFormId(row.form_id);
+                setPreselectedSubjectId(row.subject_id);
                 setPage('feedback-submit');
               }}
               onOpenVerifiedReceipt={(receipt, token) => {
